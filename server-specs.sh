@@ -75,11 +75,30 @@ fetch_cpu_info() {
 }
 
 fetch_ram_info() {
-    header "2. RAM Information"
-    separator
-    if check_tool dmidecode; then
-        log "Memory Devices (dmidecode):"
-        $SUDO_CMD dmidecode -t memory | awk '
+	header "2. RAM Information"
+	separator
+
+	# --- 2.1. System Overview (lshw/free) ---
+	if check_tool lshw; then
+		log "Total System Memory Summary (lshw):"
+		# This gives a clean summary of total size and available banks
+		$SUDO_CMD lshw -class memory | awk '
+        /size:|capacity:/ { print "Total System Size: " $2 $3 }
+        /description: System Memory/ { next } # Skip the container description
+        /description: RAM/ { print "" }
+        /slot:/ || /size:/ || /speed:/ || /manufacturer:/ || /part number:/ { gsub(/^[ \t]+/, ""); print $0 }' | head -n 30
+	else
+		# Fallback for Total System Memory
+		if check_tool free; then
+			log "\nTotal System Memory (free):"
+			free -h | awk '/^Mem:/ {print "Total RAM: " $2 " (use dmidecode for details)"}'
+		fi
+	fi
+
+	# --- 2.2. Detailed Device Info (dmidecode) ---
+	if check_tool dmidecode; then
+		log "\nDetailed Memory Devices (dmidecode):"
+		$SUDO_CMD dmidecode -t memory | awk '
         /Memory Device/ { print "\n" $0 }
         /Manufacturer|Part Number|Size|Speed|Type|Locator/ { gsub(/^[ \t]+/, ""); print }' | sed '/^\s*$/d'
 	fi
