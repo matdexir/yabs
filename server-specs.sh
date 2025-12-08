@@ -188,138 +188,147 @@ EOF
         }')
 }
 
-# fetch_cpu_info() {
-#     header "2. CPU Information"
-#     separator
-#
-#     if has lscpu; then
-#         cpu_json=$(lscpu | awk -F: '
-#             /Architecture/ {arch=$2}
-#             /Model name/ {model=$2}
-#             /^CPU\(s\)/ {cpus=$2}
-#             /Core\(s\) per socket/ {cores=$2}
-#             /Socket\(s\)/ {sockets=$2}
-#             /CPU max MHz/ {maxmhz=$2}
-#             END {gsub(/^[ \t]+|[ \t]+$/, "", arch); gsub(/^[ \t]+|[ \t]+$/, "", model); gsub(/^[ \t]+|[ \t]+$/, "", cpus);
-#                  gsub(/^[ \t]+|[ \t]+$/, "", cores); gsub(/^[ \t]+|[ \t]+$/, "", sockets); gsub(/^[ \t]+|[ \t]+$/, "", maxmhz);
-#                  printf("{\"architecture\":\"%s\",\"model\":\"%s\",\"cpus\":\"%s\",\"cores_per_socket\":\"%s\",\"sockets\":\"%s\",\"max_mhz\":\"%s\"}", arch, model, cpus, cores, sockets, maxmhz)}'
-#         )
-#     else
-#         warn "lscpu missing – limited CPU info."
-#         cpu_json='{}'
-#     fi
-#
-#     echo "$cpu_json" | jq
-# }
 
 # =====================================================================
 #   SECTION 3: RAM
 # =====================================================================
+
+# Helper function to extract a single, cleaned value from a block of text
+extract_dmi_value() {
+	local block="$1"
+	local field_name="$2"
+	local raw_value
+
+	# 1. Isolate the specific line (case-insensitive grep)
+	# 2. Use awk to isolate the part *after* the first colon, strip leading/trailing whitespace
+	raw_value=$(echo "$block" | grep -i "$field_name:" | head -n 1 | awk -F':' '{print $2}' | xargs)
+
+	# 3. Handle empty slots early
+	if [[ "$field_name" == "Size" ]] && [[ "$raw_value" == "No Module Installed" ]]; then
+		echo ""
+		return
+	fi
+
+	# 4. Remove common noise strings for cleaner parsing later
+	# Note: We keep the value here, units will be added back later if needed
+	echo "$raw_value" | sed 's/ MT\/s//' | sed 's/ Synchronous//' | xargs
+}
+
 fetch_ram_info() {
-    header "3. RAM Information"
-    separator
+	header "3. RAM Information"
+	separator
 
-    local total="0 MB"
-    local maxcap="Unknown"
-    local ram_type="Unknown"
-    ram_devices_json="[]"
+	local total="Unknown"
+	local maxcap="Unknown"
+	# Declared as local to prevent contamination
+	local ram_type=""
+	ram_devices_json="[]"
 
-    if has dmidecode; then
-        # Total installed RAM
-        total=$($SUDO dmidecode -t memory | awk -F: '/Size:/ && $2 ~ /[0-9]/ {print $2}' \
-                | awk '/MB/ {sum+=$1} /GB/ {sum+=($1*1024)} END {print sum " MB"}')
+	if ! has dmidecode; then
+		warn "dmidecode missing – RAM info limited."
+		return
+	fi
 
-        # Maximum supported RAM
-        maxcap=$($SUDO dmidecode -t memory | awk -F: '/Maximum Capacity/ {print $2}' | xargs)
+	# --- 1. Fetch Summary Info (Max Capacity, Total Installed RAM) ---
+	local dmi_memory_info=$($SUDO dmidecode -t memory 2>/dev/null || true)
+	maxcap=$(echo "$dmi_memory_info" | awk -F: '/Maximum Capacity/ {print $2}' | xargs)
 
-        # Read each Memory Device block
-        IFS=$'\n' read -d '' -r -a blocks < <($SUDO dmidecode -t memory | awk '/Memory Device$/,/^$/ {print}' | sed '/^$/d')
+	# Calculate Total Installed RAM (Reliable MB sum)
+	total=$(echo "$dmi_memory_info" | awk -F: '/Size:/ && $2 ~ /[0-9]/ {print $2}' |
+		awk '/MB/ {sum+=$1} /GB/ {sum+=($1*1024)} END {print sum " MB"}')
 
-        current_block=""
-        for line in "${blocks[@]}"; do
-            if [[ $line == "Memory Device"* ]]; then
-                # Process previous block
-                if [[ -n "$current_block" ]]; then
-                    parse_dimm_block "$current_block"
-                fi
-                current_block="$line"$'\n'
-            else
-                current_block+="$line"$'\n'
-            fi
-        done
-        # Process last block
-        parse_dimm_block "$current_block"
+	# Convert total RAM to human-readable GB/MB format
+	if has numfmt && [[ "$total" =~ MB ]]; then
+		# Convert MB to human-readable units
+		local temp_total=$(echo "$total" | numfmt --from-unit=M --to=iec-i --format="%0.0f %s" 2>/dev/null || echo "$total")
+		# Fix units to MB/GB (replace MiB/GiB with MB/GB)
+		total=$(echo "$temp_total" | sed 's/MiB/MB/' | sed 's/GiB/GB/' | xargs)
+	else
+		# fallback formatting
+		total=$(echo "$total" | sed 's/MB/ MB/' | xargs)
+	fi
 
-        # Determine dominant RAM type
-        ram_type=$(echo "$ram_devices_json" | jq -r '[.[] | .Type] | map(select(. != "")) | group_by(.) | map({type: .[0], count: length}) | max_by(.count) | .type // "Unknown"')
-    else
-        warn "dmidecode missing – RAM info limited."
-    fi
+	# --- 2. Iterate and Parse Individual DIMM Blocks (Type 17) ---
+	local raw_blocks
+	raw_blocks=$($SUDO dmidecode -t 17 2>/dev/null | sed -n '/Memory Device$/ {s/.*/***/; p;}; /Memory Device$/! p' | tr -d '\r')
 
-    # Human-readable summary table
-    printf "\nTotal System RAM:       %s\n" "$total"
-    printf "Maximum Supported RAM:  %s\n" "$maxcap"
-    printf "System RAM Type:        %s\n\n" "$ram_type"
+	IFS='*' # Change the internal field separator to the delimiter
+	for block in $raw_blocks; do
+		[[ -z "$block" ]] && continue
 
-    # Table header
-    printf "%-8s | %-6s | %-8s | %-12s | %-12s\n" "Size" "Type" "Speed" "Manufacturer" "Serial"
-    printf "%s\n" "--------------------------------------------------------------------------------"
+		# Use the strict helper function for each field
+		local size_raw=$(extract_dmi_value "$block" "Size")
+		[[ -z "$size_raw" ]] && continue # Skip if empty slot (helper returns "")
 
-    # Table rows
-    echo "$ram_devices_json" | jq -r '.[] | [.Size, .Type, .Speed, .Manufacturer, .Serial] | @tsv' \
-        | while IFS=$'\t' read -r size type speed manufacturer serial; do
-            printf "%-8s | %-6s | %-8s | %-12s | %-12s\n" "$size" "$type" "$speed" "$manufacturer" "$serial"
-        done
+		local type=$(extract_dmi_value "$block" "Type")
+		local speed=$(extract_dmi_value "$block" "Speed")
+		local manufacturer=$(extract_dmi_value "$block" "Manufacturer")
+		local serial=$(extract_dmi_value "$block" "Serial Number")
 
-    # JSON summary
-    ram_json=$(jq -n --arg total "$total" --arg maxcap "$maxcap" --arg type "$ram_type" \
-        --argjson dimms "$ram_devices_json" \
-        '{ total: $total, max_supported: $maxcap, type: $type, dimms: $dimms }')
+		# Determine the unit and value (M for MB, G for GB)
+		local size_value=""
+		local size_unit=""
+
+		if [[ "$size_raw" =~ MB ]]; then
+			size_value=$(echo "$size_raw" | sed 's/MB//' | xargs)
+			size_unit="MB"
+		elif [[ "$size_raw" =~ GB ]]; then
+			size_value=$(echo "$size_raw" | sed 's/GB//' | xargs)
+			size_unit="GB"
+		else
+			size_value="$size_raw" # Use raw if no unit found
+		fi
+
+		local final_size="$size_raw"
+		# Convert size unit if numfmt is available
+		if has numfmt && [[ "$size_unit" == "MB" ]]; then
+			# Convert MB value to GB/MB human format
+			final_size=$(echo "$size_value" | numfmt --from-unit=M --to-unit=G --to-unit=iec-i --format="%0.0f %s" 2>/dev/null || echo "$size_value MB")
+			final_size=$(echo "$final_size" | sed 's/\([0-9]\+\) M/\1 MB/' | sed 's/\([0-9]\+\) G/\1 GB/' | xargs)
+		elif [[ "$size_unit" == "GB" ]]; then
+			final_size="$size_value GB"
+		fi
+
+		# Build JSON array
+		ram_devices_json=$(echo "$ram_devices_json" | jq -c \
+			--arg size "$final_size" --arg type "$type" \
+			--arg speed "$speed" --arg manufacturer "$manufacturer" --arg serial "$serial" \
+			'. += [{Size: $size, Type: $type, Speed: $speed, Manufacturer: $manufacturer, Serial: $serial}]')
+	done
+	IFS=$' \t\n' # Restore IFS
+
+	# --- 3. Determine dominant RAM Type (Variable protection fix) ---
+	local determined_type=$(echo "$ram_devices_json" | jq -r '
+	    map(.Type) |                     # Collect all Type fields into an array
+	    map(select(. != "")) |           # Remove empty types
+	    group_by(.) |                    # Group by type
+	    map({type: .[0], count: length}) |
+	    max_by(.count)? |                # Pick the most common type safely
+	    .type // "Unknown"')
+
+	ram_type=$(echo "$determined_type" | xargs)
+
+	# Human-readable summary table
+	printf "\nTotal System RAM:         %s\n" "$total"
+	printf "Maximum Supported RAM:    %s\n" "$maxcap"
+	printf "System RAM Type:          %s\n\n" "$ram_type"
+
+	# Table header
+	printf "%-8s | %-6s | %-8s | %-12s | %-12s\n" "Size" "Type" "Speed" "Manufacturer" "Serial"
+	printf "%s\n" "--------------------------------------------------------------------------------"
+
+	# Table rows
+	echo "$ram_devices_json" | jq -r '.[] | [.Size, .Type, .Speed, .Manufacturer, .Serial] | @tsv' |
+		while IFS=$'\t' read -r size type speed manufacturer serial; do
+			printf "%-8s | %-6s | %-8s | %-12s | %-12s\n" "$size" "$type" "$speed" "$manufacturer" "$serial"
+		done
+
+	# JSON summary
+	ram_json=$(jq -n \
+		--arg total "$total" --arg maxcap "$maxcap" --arg type "$ram_type" \
+		--argjson dimms "$ram_devices_json" \
+		'{ total: $total, max_supported: $maxcap, type: $type, dimms: $dimms }')
 }
-
-# Helper function remains the same
-parse_dimm_block() {
-    local block="$1"
-    local size type speed manufacturer serial
-
-    size=$(echo "$block" | awk -F: '/Size/ {print $2}' | xargs)
-    [[ "$size" == "No Module Installed" || -z "$size" ]] && return
-
-    type=$(echo "$block" | awk -F: '/Type/ && $2 !~ /Unknown/ {print $2}' | xargs)
-    speed=$(echo "$block" | awk -F: '/Speed/ {print $2}' | xargs)
-    manufacturer=$(echo "$block" | awk -F: '/Manufacturer/ {print $2}' | xargs)
-    serial=$(echo "$block" | awk -F: '/Serial Number/ {print $2}' | xargs)
-
-    # Append to JSON array
-    ram_devices_json=$(echo "$ram_devices_json" | jq --arg size "$size" --arg type "$type" \
-        --arg speed "$speed" --arg manufacturer "$manufacturer" --arg serial "$serial" \
-        '. += [{Size: $size, Type: $type, Speed: $speed, Manufacturer: $manufacturer, Serial: $serial}]')
-}
-# fetch_ram_info() {
-#     header "3. RAM Information"
-#     separator
-#
-#     local total="0 MB" maxcap="Unknown"
-#     if has dmidecode; then
-#         maxcap=$($SUDO dmidecode -t memory | awk -F: '/Maximum Capacity/ {print $2}' | xargs)
-#         total=$($SUDO dmidecode -t memory | awk -F: '/Size:/ && $2 ~ /[0-9]/ {print $2}' | awk '/MB/{sum+=$1}/GB/{sum+=($1*1024)}END{print sum " MB"}')
-#     fi
-#
-#     echo "Total System RAM: $total"
-#     echo "Maximum Supported RAM: $maxcap"
-#
-#     ram_json=$(jq -n --arg total "$total" --arg maxcap "$maxcap" '{ total: $total, max_supported: $maxcap }')
-#
-#     # DIMM details
-#     ram_devices_json="[]"
-#     if has dmidecode; then
-#         while IFS= read -r block; do
-#             [[ -z "$block" ]] && continue
-#             dev_json=$(echo "$block" | jq -Rn '(input|split("\n")) as $lines | reduce $lines[] as $l ({}; if ($l|test(": ")) then ($l|split(": ")) as $kv | . + { ($kv[0]|gsub(" ";"_")): ($kv[1]) } else . end)')
-#             ram_devices_json=$(echo "$ram_devices_json" | jq --argjson d "$dev_json" '. += [$d]')
-#         done < <($SUDO dmidecode -t memory | awk '/Memory Device$/,/^$/' | sed '/^Memory Device$/d')
-#     fi
-# }
 
 # =====================================================================
 #   SECTION 4: DISKS
