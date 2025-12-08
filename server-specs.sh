@@ -350,8 +350,10 @@ fetch_disk_info() {
 # =====================================================================
 
 fetch_raid_info() {
-    header "5. RAID Information"
+    header "5. RAID Controllers"
     separator
+
+    local raid_json='[]'
 
     local mdstat=""
     if [ -r /proc/mdstat ]; then
@@ -361,7 +363,65 @@ fetch_raid_info() {
         warn "Cannot read /proc/mdstat"
     fi
 
-    raid_json=$(jq -n --arg md "$mdstat" '{ mdstat: $md }')
+    # ------------------------------------------------------------
+    # 1. Detect RAID / Storage controllers via lspci
+    # ------------------------------------------------------------
+    if command -v lspci >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            local pci=$(echo "$line" | awk '{print $1}')
+            local desc=$(echo "$line" | cut -d' ' -f2-)
+
+            if echo "$desc" | grep -iqE "RAID|SAS|Storage Controller|MegaRAID|Smart Array|PERC|Adaptec|Broadcom"; then
+                local brand=$(echo "$desc" | sed 's/.*: //')
+                raid_json=$(echo "$raid_json" | jq -c --arg pci "$pci" --arg brand "$brand" \
+                    '. += [{pci: $pci, brand: $brand, firmware: "Unknown", raid_level: "Unknown"}]')
+            fi
+        done <<< "$(lspci -Dvmm | awk '/^Slot:/ {printf "%s ",$2} /^Class:/ {printf "%s ",$2} /^Vendor:/ {printf "%s ",$2} /^Device:/ {print $2}')"
+    else
+        warn "lspci not found — cannot detect RAID controllers."
+    fi
+
+    # ------------------------------------------------------------
+    # 2. Query firmware and RAID level if storcli / MegaCli available
+    # ------------------------------------------------------------
+    if command -v storcli >/dev/null 2>&1; then
+        for ctl in $(storcli show | awk '/Controller/ {print $2}'); do
+            fw=$(storcli /c"$ctl" show | awk -F: '/FW Version/ {gsub(/ /,"",$2); print $2}')
+            # Get RAID level for each virtual drive
+            while IFS= read -r vd; do
+                raid_level=$(storcli /c"$ctl"/v"$vd" show | awk -F: '/RAID Level/ {gsub(/ /,"",$2); print $2}')
+                raid_json=$(echo "$raid_json" | jq --arg ctl "$ctl" --arg fw "$fw" --arg rl "$raid_level" \
+                    'map(if .pci == $ctl then . + {firmware: $fw, raid_level: $rl} else . end)')
+            done < <(storcli /c"$ctl"/vall show | awk '/^VD:/ {print $2}')
+        done
+    elif command -v MegaCli >/dev/null 2>&1; then
+        for ctl in $(MegaCli -AdpCount 2>/dev/null | awk '/Controller Count/ {print $4}'); do
+            fw=$(MegaCli -AdpAllInfo -a"$ctl" 2>/dev/null | awk -F: '/Firmware Version/ {gsub(/ /,"",$2); print $2; exit}')
+            while IFS= read -r vd; do
+                raid_level=$(MegaCli -LDInfo -L"$vd" -a"$ctl" 2>/dev/null | awk -F: '/RAID Level/ {gsub(/ /,"",$2); print $2}')
+                raid_json=$(echo "$raid_json" | jq --arg ctl "$ctl" --arg fw "$fw" --arg rl "$raid_level" \
+                    'map(if .pci == $ctl then . + {firmware: $fw, raid_level: $rl} else . end)')
+            done < <(MegaCli -LDInfo -Lall -a"$ctl" 2>/dev/null | awk '/^Virtual Drive:/ {print $3}')
+        done
+    fi
+
+    # ------------------------------------------------------------
+    # 3. Human-readable table
+    # ------------------------------------------------------------
+    echo ""
+    echo "=== RAID Controllers ==="
+    printf "%-12s | %-35s | %-20s | %-10s\n" "PCI" "Brand" "Firmware" "RAID Level"
+    echo "----------------------------------------------------------------------"
+
+    echo "$raid_json" | jq -r '.[] | [.pci,.brand,.firmware,.raid_level] | @tsv' |
+    while IFS=$'\t' read -r pci brand fw rl; do
+        printf "%-12s | %-35s | %-20s | %-10s\n" "$pci" "$brand" "$fw" "$rl"
+    done
+
+    # ------------------------------------------------------------
+    # 4. Export JSON
+    # ------------------------------------------------------------
+    raid_controllers_json="$raid_json"
 }
 
 # =====================================================================
