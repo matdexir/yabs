@@ -417,16 +417,128 @@ fetch_gpu_info() {
 #   SECTION 7: NETWORK
 # =====================================================================
 fetch_network_info() {
-    header "7. Network Interfaces"
+    header "7. Network / DPU Information"
     separator
 
-    net_json="[]"
-    if has ip; then
-        while IFS= read -r line; do
-            echo "$line"
-            net_json=$(echo "$net_json" | jq --arg l "$line" '. += [$l]')
-        done < <(ip -br a)
-    fi
+    net_devices_json="[]"
+
+    # All PCI Network/Ethernet controllers
+    local pci_list=$(lspci -D | grep -Ei 'Ethernet|Network')
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        local pci_addr=$(echo "$line" | awk '{print $1}')
+        local description=$(echo "$line" | cut -d ' ' -f2-)
+        local vendor=$(echo "$line" | cut -d ':' -f3- | xargs)
+
+        local dev_path="/sys/bus/pci/devices/${pci_addr}"
+
+        # ----- Driver Detection -----
+        local driver="Unknown"
+        if [[ -L "$dev_path/driver" ]]; then
+            driver=$(basename "$(readlink -f "$dev_path/driver")")
+        fi
+
+        # ----- Version Detection -----
+        local driver_version="Unknown"
+        if [[ -f "/sys/module/$driver/version" ]]; then
+            driver_version=$(cat "/sys/module/$driver/version" 2>/dev/null)
+        fi
+
+        # ----- lspci provides revision -----
+        local revision=$(lspci -D -vvv -s "$pci_addr" 2>/dev/null | awk '/Rev:/ {print $2}' | xargs)
+        [[ -z "$revision" ]] && revision="Unknown"
+
+        # ----- Determine Device Type (NIC or DPU) -----
+        local dev_type="NIC"
+        if [[ "$vendor" =~ Mellanox|NVIDIA|BlueField|Pensando|IPU|DPU ]]; then
+            dev_type="DPU"
+        fi
+        if [[ -f "$dev_path/class" ]] && ! grep -q "020000" "$dev_path/class"; then
+            dev_type="DPU"
+        fi
+
+        # ----- Interface collection -----
+        local iface_json="[]"
+        local interfaces=()
+        if [[ -d "$dev_path/net" ]]; then
+            interfaces=($(ls "$dev_path/net"))
+        fi
+
+        for iface in "${interfaces[@]}"; do
+            local mac=$(cat "/sys/class/net/$iface/address")
+            local speed="Unknown"
+            local fw_version="Unknown"
+
+            # NIC/DPU firmware from ethtool
+            if has ethtool; then
+                speed=$(ethtool "$iface" 2>/dev/null | awk -F: '/Speed/ {gsub(/ /,"",$2); print $2}')
+                fw_version=$(ethtool -i "$iface" 2>/dev/null | awk -F: '/firmware-version/ {print $2}' | xargs)
+            fi
+
+            # BlueField / Mellanox exposes additional FW version in sysfs
+            if [[ -f "$dev_path/firmware_version" ]]; then
+                fw_version=$(cat "$dev_path/firmware_version" 2>/dev/null)
+            fi
+            if [[ "$fw_version" == "" ]]; then
+                [[ -f "$dev_path/fw_version" ]] && fw_version=$(cat "$dev_path/fw_version" 2>/dev/null)
+            fi
+
+            iface_json=$(echo "$iface_json" | jq -c \
+                --arg iface "$iface" \
+                --arg mac "$mac" \
+                --arg speed "$speed" \
+                --arg fw "$fw_version" \
+                '. += [{Interface: $iface, MAC: $mac, Speed: $speed, Firmware: $fw}]')
+        done
+
+        # ----- Add main PCI device entry -----
+        net_devices_json=$(echo "$net_devices_json" | jq -c \
+            --arg pci "$pci_addr" \
+            --arg vendor "$vendor" \
+            --arg desc "$description" \
+            --arg driver "$driver" \
+            --arg dver "$driver_version" \
+            --arg rev "$revision" \
+            --arg type "$dev_type" \
+            --argjson ifaces "$iface_json" \
+            '. += [{
+                PCI: $pci,
+                Vendor: $vendor,
+                Brand: $desc,
+                Driver: $driver,
+                DriverVersion: $dver,
+                Revision: $rev,
+                Type: $type,
+                Interfaces: $ifaces
+            }]')
+    done <<< "$pci_list"
+
+    # ----- Output Table -----
+    printf "%-14s | %-6s | %-10s | %-12s | %-40s | %-40s | %-30s\n" \
+        "PCI Address" "Type" "Driver" "Interface" "MAC Address" "Firmware" "Brand"
+    printf "%s\n" "------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+
+    echo "$net_devices_json" | jq -r '
+        .[] as $dev |
+        ($dev.Interfaces[]? // {Interface:"-",MAC:"-",Firmware:"-"}) |
+        [
+            $dev.PCI,
+            $dev.Type,
+            $dev.Driver,
+            .Interface,
+            .MAC,
+            .Firmware,
+            $dev.Brand
+        ] | @tsv' |
+    while IFS=$'\t' read -r pci type driver iface mac fw brand; do
+        printf "%-14s | %-6s | %-10s | %-12s | %-40s | %-40s | %-30s\n" \
+            "$pci" "$type" "$driver" "$iface" "$mac" "$fw" "$brand"
+    done
+
+    # ----- Final JSON Output -----
+    net_json=$(jq -n --argjson devices "$net_devices_json" '{network_devices: $devices}')
 }
 
 # =====================================================================
