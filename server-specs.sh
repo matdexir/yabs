@@ -541,6 +541,192 @@ fetch_network_info() {
     net_json=$(jq -n --argjson devices "$net_devices_json" '{network_devices: $devices}')
 }
 
+fetch_hsi_info() {
+    header "4. High-Speed Interconnects (InfiniBand & NVSwitch)"
+    separator
+
+    local hsi_json='{"infini_band":[],"nv_switch":[]}'
+    
+    #
+    # --------------------------------------------------------------------
+    # 1. DETECT INFINIBAND HCAs
+    # --------------------------------------------------------------------
+    #
+
+    if [[ -d /sys/class/infiniband ]]; then
+        for hca in /sys/class/infiniband/*; do
+            [[ ! -d "$hca" ]] && continue
+            local name=$(basename "$hca")
+
+            local fw=$(cat "$hca/fw_ver" 2>/dev/null || echo "Unknown")
+            local node_desc=$(cat "$hca/node_desc" 2>/dev/null || echo "Unknown")
+            local hca_type=$(cat "$hca/hca_type" 2>/dev/null || echo "Unknown")
+
+            # Add base HCA record
+            hsi_json=$(echo "$hsi_json" | jq --arg n "$name" --arg fw "$fw" \
+                --arg nd "$node_desc" --arg ht "$hca_type" '
+                .infini_band += [{
+                    name: $n,
+                    firmware: $fw,
+                    node_desc: $nd,
+                    hca_type: $ht,
+                    ports: []
+                }]')
+
+            # Now find ports
+            for port in "$hca/ports/"*; do
+                [[ ! -d "$port" ]] && continue
+                local pnum=$(basename "$port")
+
+                local state=$(cat "$port/state" 2>/dev/null | awk '{print $2}' || echo "Unknown")
+                local phys_state=$(cat "$port/phys_state" 2>/dev/null | awk '{print $2}' || echo "Unknown")
+                local rate=$(cat "$port/rate" 2>/dev/null || echo "Unknown")
+
+                # Attach port details
+                hsi_json=$(echo "$hsi_json" | jq \
+                    --arg n "$name" --arg pn "$pnum" \
+                    --arg st "$state" --arg ps "$phys_state" --arg rt "$rate" '
+                    .infini_band |=
+                        map(if .name == $n then
+                            .ports += [{
+                                port: $pn,
+                                state: $st,
+                                phys_state: $ps,
+                                rate: $rt
+                            }]
+                        else . end)
+                ')
+            done
+        done
+    else
+        warn "InfiniBand subsystem not present."
+    fi
+
+
+    #
+    # --------------------------------------------------------------------
+    # 2. DETECT NVSWITCH (DGX-A100/H100/GB200, HGX Nodes)
+    # --------------------------------------------------------------------
+    #
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+
+        # Query basic switch list
+        local switch_info
+        switch_info=$(nvidia-smi --query-switch=index,uuid,family,model,firmware_version --format=csv,noheader 2>/dev/null)
+
+        if [[ -n "$switch_info" ]]; then
+            while IFS=',' read -r idx uuid fam model fw; do
+                idx=$(echo "$idx" | xargs)
+                uuid=$(echo "$uuid" | xargs)
+                fam=$(echo "$fam" | xargs)
+                model=$(echo "$model" | xargs)
+                fw=$(echo "$fw" | xargs)
+
+                hsi_json=$(echo "$hsi_json" | jq \
+                    --arg idx "$idx" --arg uuid "$uuid" --arg fam "$fam" --arg model "$model" --arg fw "$fw" '
+                    .nv_switch += [{
+                        index: $idx,
+                        uuid: $uuid,
+                        family: $fam,
+                        model: $model,
+                        firmware: $fw,
+                        links: []
+                    }]')
+            done <<< "$switch_info"
+        fi
+
+        #
+        # Query NVLink topology per NVSwitch
+        #
+        local link_data
+        link_data=$(nvidia-smi nvlink --format=csv,noheader 2>/dev/null)
+
+        if [[ -n "$link_data" ]]; then
+            while IFS=',' read -r sw gpu link bw state; do
+                sw=$(echo "$sw" | xargs)
+                gpu=$(echo "$gpu" | xargs)
+                link=$(echo "$link" | xargs)
+                bw=$(echo "$bw" | xargs)
+                state=$(echo "$state" | xargs)
+
+                hsi_json=$(echo "$hsi_json" | jq \
+                    --arg sw "$sw" --arg gpu "$gpu" --arg link "$link" \
+                    --arg bw "$bw" --arg st "$state" '
+                    .nv_switch |=
+                        map(if .index == $sw then
+                            .links += [{
+                                link: $link,
+                                gpu: $gpu,
+                                bandwidth: $bw,
+                                state: $st
+                            }]
+                        else . end)
+                ')
+            done <<< "$link_data"
+        fi
+
+    else
+        warn "NVIDIA NVSwitch requires nvidia-smi."
+    fi
+
+    #
+    # --------------------------------------------------------------------
+    # PRINT HUMAN-READABLE TABLES
+    # --------------------------------------------------------------------
+    #
+
+    echo ""
+    echo "InfiniBand HCAs:"
+    printf "%-10s | %-20s | %-20s | %-30s\n" "HCA" "Firmware" "Type" "Node Description"
+    echo "-------------------------------------------------------------------------------------------------------------"
+
+    echo "$hsi_json" | jq -r '
+        .infini_band[] | [.name, .firmware, .hca_type, .node_desc] | @tsv' |
+        while IFS=$'\t' read -r n fw ht nd; do
+            printf "%-10s | %-20s | %-20s | %-30s\n" "$n" "$fw" "$ht" "$nd"
+        done
+
+    echo ""
+    echo "InfiniBand Ports:"
+    printf "%-10s | %-5s | %-10s | %-10s | %-10s\n" "HCA" "Port" "State" "PhysState" "Rate"
+    echo "-------------------------------------------------------------------"
+
+    echo "$hsi_json" | jq -r '
+        .infini_band[] as $hca |
+        $hca.ports[]? |
+        [$hca.name, .port, .state, .phys_state, .rate] | @tsv' |
+        while IFS=$'\t' read -r h p st ps rt; do
+            printf "%-10s | %-5s | %-10s | %-10s | %-10s\n" "$h" "$p" "$st" "$ps" "$rt"
+        done
+
+    echo ""
+    echo "NVSwitch:"
+    printf "%-5s | %-40s | %-15s | %-25s\n" "Idx" "UUID" "Firmware" "Model"
+    echo "--------------------------------------------------------------------------"
+
+    echo "$hsi_json" | jq -r '
+        .nv_switch[] | [.index, .uuid, .firmware, .model] | @tsv' |
+        while IFS=$'\t' read -r idx uuid fw model; do
+            printf "%-5s | %-40s | %-15s | %-25s\n" "$idx" "$uuid" "$fw" "$model"
+        done
+
+    echo ""
+    echo "NVSwitch Links:"
+    printf "%-5s | %-5s | %-5s | %-12s | %-10s\n" "Sw" "Link" "GPU" "Bandwidth" "State"
+    echo "------------------------------------------------------------------"
+
+    echo "$hsi_json" | jq -r '
+        .nv_switch[] as $sw |
+        $sw.links[]? |
+        [$sw.index, .link, .gpu, .bandwidth, .state] | @tsv' |
+        while IFS=$'\t' read -r s l g bw st; do
+            printf "%-5s | %-5s | %-5s | %-12s | %-10s\n" "$s" "$l" "$g" "$bw" "$st"
+        done
+
+    hsi_data="$hsi_json"
+}
+
 # =====================================================================
 #   RUNNING SEQUENCE
 # =====================================================================
@@ -558,6 +744,7 @@ fetch_raid_info
 fetch_pci_info
 fetch_gpu_info
 fetch_network_info
+fetch_hsi_info
 
 # =====================================================================
 #   JSON OUTPUT
