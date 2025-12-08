@@ -43,17 +43,184 @@ exit 0
 # ---------------------------
 JSON_MODE=0
 JSON_TREE_MODE=0
+VALIDATE_MODE=0
 
 case "$1" in
-    --json) JSON_MODE=1 ;;
-    --json-tree) JSON_TREE_MODE=1 ;;
-    -h|--help) show_help ;;
+--json) JSON_MODE=1 ;;
+--json-tree) JSON_TREE_MODE=1 ;;
+--validate) VALIDATE_MODE=1 ;;
+-h | --help) show_help ;;
 esac
 
 # ---------------------------
 #   TOOL CHECKER
 # ---------------------------
 has() { command -v "$1" >/dev/null 2>&1; }
+
+validate() {
+	echo -e "${BLUE}VALIDATION MODE – Environment & Capability Check${NC}"
+	separator
+
+	declare -A required_tools=(
+		["dmidecode"]="DMI tables"
+		["lscpu"]="CPU info"
+		["smartctl"]="Disk SMART info"
+		["lspci"]="PCI devices"
+		["ip"]="Network interfaces"
+		["jq"]="JSON processing"
+	)
+
+	tool_report="{}"
+	perm_report="{}"
+	sanity_report="{}"
+
+	echo -e "${BLUE}1. Checking required tools${NC}"
+
+	for tool in "${!required_tools[@]}"; do
+		if has "$tool"; then
+			echo -e "[${GREEN}OK${NC}] $tool found"
+			tool_report=$(echo "$tool_report" | jq --arg k "$tool" --arg v "ok" '. + {($k): $v}')
+		else
+			echo -e "[${RED}FAIL${NC}] $tool missing (needed for: ${required_tools[$tool]})"
+			tool_report=$(echo "$tool_report" | jq --arg k "$tool" --arg v "missing" '. + {($k): $v}')
+		fi
+	done
+
+	echo ""
+	echo -e "${BLUE}2. Checking permissions${NC}"
+
+	# DMI Permission
+	if $SUDO dmidecode -s system-manufacturer >/dev/null 2>&1; then
+		echo -e "[${GREEN}OK${NC}] DMI tables accessible"
+		perm_report=$(echo "$perm_report" | jq '. + { dmi: "ok" }')
+	else
+		echo -e "[${RED}FAIL${NC}] Cannot read DMI tables"
+		perm_report=$(echo "$perm_report" | jq '. + { dmi: "fail" }')
+	fi
+
+	# mdstat Permission
+	if [[ -r /proc/mdstat ]]; then
+		echo -e "[${GREEN}OK${NC}] /proc/mdstat readable"
+		perm_report=$(echo "$perm_report" | jq '. + { mdstat: "ok" }')
+	else
+		echo -e "[${YELLOW}WARN${NC}] Cannot read /proc/mdstat"
+		perm_report=$(echo "$perm_report" | jq '. + { mdstat: "warn" }')
+	fi
+
+	echo ""
+	echo -e "${BLUE}3. Running collector sanity tests${NC}"
+
+	# Test collectors quietly
+	fetch_cpu_info >/dev/null 2>&1
+	fetch_ram_info >/dev/null 2>&1
+	fetch_disk_info >/dev/null 2>&1
+	fetch_pci_info >/dev/null 2>&1
+	fetch_network_info >/dev/null 2>&1
+
+	# Basic sanity:
+	cpu_ok="fail"
+	if [[ -n "$(echo "$cpu_json" | jq -r '.cpus')" ]]; then cpu_ok="ok"; fi
+
+	ram_ok="fail"
+	if [[ "$(echo "$ram_json" | jq -r '.total')" != "0 MB" ]]; then ram_ok="ok"; fi
+
+	disk_ok="fail"
+	if [[ "$(echo "$disks_json" | jq 'length')" -gt 0 ]]; then disk_ok="ok"; fi
+
+	net_ok="fail"
+	if [[ "$(echo "$net_json" | jq 'length')" -gt 0 ]]; then net_ok="ok"; fi
+
+	sanity_report=$(jq -n \
+		--arg cpu "$cpu_ok" \
+		--arg ram "$ram_ok" \
+		--arg disks "$disk_ok" \
+		--arg net "$net_ok" \
+		'{ cpu: $cpu, ram: $ram, disks: $disks, network: $net }')
+
+	echo -e "[CPU]     $cpu_ok"
+	echo -e "[RAM]     $ram_ok"
+	echo -e "[Disks]   $disk_ok"
+	echo -e "[Network] $net_ok"
+
+	echo ""
+	echo -e "${BLUE}4. JSON integrity check${NC}"
+
+	# Build final canonical JSON silently
+	canonical_json=$(jq -n \
+		--argjson sys "$system_info_json" \
+		--argjson cpu "$cpu_json" \
+		--argjson ram "$ram_json" \
+		--argjson dimms "$ram_devices_json" \
+		--argjson disks "$disks_json" \
+		--argjson raid "$raid_json" \
+		--argjson pci "$pci_json" \
+		--argjson net "$net_json" \
+		'{ system: $sys, cpu: $cpu,
+           ram: { summary: $ram, dimms: $dimms },
+           storage: { disks: $disks, raid: $raid },
+           pci: $pci,
+           network: { interfaces: $net } }')
+
+	if echo "$canonical_json" | jq empty >/dev/null 2>&1; then
+		echo -e "[${GREEN}OK${NC}] JSON validates"
+		json_ok="ok"
+	else
+		echo -e "[${RED}FAIL${NC}] JSON invalid"
+		json_ok="fail"
+	fi
+
+	# Final report
+	validation_report=$(jq -n \
+		--argjson tools "$tool_report" \
+		--argjson perms "$perm_report" \
+		--argjson sanity "$sanity_report" \
+		--arg json "$json_ok" \
+		'{ tools: $tools, permissions: $perms, collectors: $sanity, json_valid: $json }')
+
+	echo ""
+	echo -e "${BLUE}Validation Complete${NC}"
+	echo "$validation_report"
+	# Determine exit code
+	exit_code=0
+
+	# Check critical tools
+	for tool in "${!required_tools[@]}"; do
+		status=$(echo "$tool_report" | jq -r --arg t "$tool" '.[$t]')
+		if [[ "$status" == "missing" ]]; then
+			exit_code=2
+			break
+		fi
+	done
+
+	# Check critical permissions
+	if [[ $(echo "$perm_report" | jq -r '.dmi') != "ok" ]]; then
+		exit_code=2
+	fi
+
+	# Check JSON validity
+	if [[ "$json_ok" != "ok" ]]; then
+		exit_code=2
+	fi
+
+	# Minor warnings: collectors
+	for c in cpu ram disks network; do
+		status=$(echo "$sanity_report" | jq -r --arg c "$c" '.[$c]')
+		if [[ "$status" != "ok" && "$exit_code" -lt 2 ]]; then
+			exit_code=1
+		fi
+	done
+
+	# Print final status
+	if [[ $exit_code -eq 0 ]]; then
+		echo -e "${GREEN}Validation PASSED: all systems OK${NC}"
+	elif [[ $exit_code -eq 1 ]]; then
+		echo -e "${YELLOW}Validation COMPLETED with warnings${NC}"
+	else
+		echo -e "${RED}Validation FAILED: critical issues detected${NC}"
+	fi
+
+	exit $exit_code
+}
 
 # ---------------------------
 #   GLOBALS
@@ -303,6 +470,12 @@ fetch_network_info() {
 # =====================================================================
 #   RUN EVERYTHING
 # =====================================================================
+# If validation mode requested, run only validator and exit
+if [[ $VALIDATE_MODE -eq 1 ]]; then
+	validate
+	exit 0
+fi
+
 fetch_system_info
 fetch_cpu_info
 fetch_ram_info
