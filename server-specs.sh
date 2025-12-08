@@ -106,7 +106,7 @@ disks_json="[]"
 raid_json="{}"
 pci_json="[]"
 gpu_json="[]"
-net_json="[]"
+interconnect_json="{}"
 
 # =====================================================================
 #   SECTION 1: SYSTEM & BIOS
@@ -146,7 +146,6 @@ fetch_cpu_info() {
     header "2. CPU Information"
     separator
 
-    # Initialize variables
     local arch="" model="" cpus="" cores="" sockets="" maxmhz=""
 
     if has lscpu; then
@@ -160,7 +159,6 @@ fetch_cpu_info() {
         warn "lscpu missing – limited CPU info."
     fi
 
-    # Human-readable output
     cat << EOF
 Model:           $model
 Architecture:    $arch
@@ -170,7 +168,6 @@ Sockets:         $sockets
 Max MHz:         $maxmhz
 EOF
 
-    # JSON output
     cpu_json=$(jq -n \
         --arg arch "$arch" \
         --arg model "$model" \
@@ -178,21 +175,13 @@ EOF
         --arg cores "$cores" \
         --arg sockets "$sockets" \
         --arg maxmhz "$maxmhz" \
-        '{ 
-            architecture: $arch, 
-            model: $model, 
-            cpus: $cpus, 
-            cores_per_socket: $cores,
-            sockets: $sockets, 
-            max_mhz: $maxmhz 
-        }')
+        '{ architecture: $arch, model: $model, cpus: $cpus, cores_per_socket: $cores,
+           sockets: $sockets, max_mhz: $maxmhz }')
 }
-
 
 # =====================================================================
 #   SECTION 3: RAM
 # =====================================================================
-
 # Helper function to extract a single, cleaned value from a block of text
 extract_dmi_value() {
 	local block="$1"
@@ -333,6 +322,7 @@ fetch_ram_info() {
 # =====================================================================
 #   SECTION 4: DISKS
 # =====================================================================
+
 fetch_disk_info() {
     header "4. Disk Information"
     separator
@@ -358,6 +348,7 @@ fetch_disk_info() {
 # =====================================================================
 #   SECTION 5: RAID
 # =====================================================================
+
 fetch_raid_info() {
     header "5. RAID Information"
     separator
@@ -376,6 +367,7 @@ fetch_raid_info() {
 # =====================================================================
 #   SECTION 6: PCI & GPU
 # =====================================================================
+
 fetch_pci_info() {
     header "6. PCI Devices"
     separator
@@ -414,158 +406,92 @@ fetch_gpu_info() {
 }
 
 # =====================================================================
-#   SECTION 7: NETWORK
+#   SECTION 7: HIGH-SPEED INTERCONNECTS (replacement)
+#   fetch_network_info() and fetch_hsi_info() removed; replaced by
+#   your consolidated fetch_interconnect_info()
 # =====================================================================
-fetch_network_info() {
-    header "7. Network / DPU Information"
+fetch_interconnect_info() {
+
+    header "4. High-Speed Interconnects (NIC / DPU / InfiniBand / NVLink / NVSwitch)"
     separator
 
-    net_devices_json="[]"
+    local ic_json='{"ethernet":[],"infiniband":[],"nvswitch":[]}'
 
-    # All PCI Network/Ethernet controllers
-    local pci_list=$(lspci -D | grep -Ei 'Ethernet|Network')
-
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-
-        local pci_addr=$(echo "$line" | awk '{print $1}')
-        local description=$(echo "$line" | cut -d ' ' -f2-)
-        local vendor=$(echo "$line" | cut -d ':' -f3- | xargs)
-
-        local dev_path="/sys/bus/pci/devices/${pci_addr}"
-
-        # ----- Driver Detection -----
-        local driver="Unknown"
-        if [[ -L "$dev_path/driver" ]]; then
-            driver=$(basename "$(readlink -f "$dev_path/driver")")
-        fi
-
-        # ----- Version Detection -----
-        local driver_version="Unknown"
-        if [[ -f "/sys/module/$driver/version" ]]; then
-            driver_version=$(cat "/sys/module/$driver/version" 2>/dev/null)
-        fi
-
-        # ----- lspci provides revision -----
-        local revision=$(lspci -D -vvv -s "$pci_addr" 2>/dev/null | awk '/Rev:/ {print $2}' | xargs)
-        [[ -z "$revision" ]] && revision="Unknown"
-
-        # ----- Determine Device Type (NIC or DPU) -----
-        local dev_type="NIC"
-        if [[ "$vendor" =~ Mellanox|NVIDIA|BlueField|Pensando|IPU|DPU ]]; then
-            dev_type="DPU"
-        fi
-        if [[ -f "$dev_path/class" ]] && ! grep -q "020000" "$dev_path/class"; then
-            dev_type="DPU"
-        fi
-
-        # ----- Interface collection -----
-        local iface_json="[]"
-        local interfaces=()
-        if [[ -d "$dev_path/net" ]]; then
-            interfaces=($(ls "$dev_path/net"))
-        fi
-
-        for iface in "${interfaces[@]}"; do
-            local mac=$(cat "/sys/class/net/$iface/address")
-            local speed="Unknown"
-            local fw_version="Unknown"
-
-            # NIC/DPU firmware from ethtool
-            if has ethtool; then
-                speed=$(ethtool "$iface" 2>/dev/null | awk -F: '/Speed/ {gsub(/ /,"",$2); print $2}')
-                fw_version=$(ethtool -i "$iface" 2>/dev/null | awk -F: '/firmware-version/ {print $2}' | xargs)
-            fi
-
-            # BlueField / Mellanox exposes additional FW version in sysfs
-            if [[ -f "$dev_path/firmware_version" ]]; then
-                fw_version=$(cat "$dev_path/firmware_version" 2>/dev/null)
-            fi
-            if [[ "$fw_version" == "" ]]; then
-                [[ -f "$dev_path/fw_version" ]] && fw_version=$(cat "$dev_path/fw_version" 2>/dev/null)
-            fi
-
-            iface_json=$(echo "$iface_json" | jq -c \
-                --arg iface "$iface" \
-                --arg mac "$mac" \
-                --arg speed "$speed" \
-                --arg fw "$fw_version" \
-                '. += [{Interface: $iface, MAC: $mac, Speed: $speed, Firmware: $fw}]')
-        done
-
-        # ----- Add main PCI device entry -----
-        net_devices_json=$(echo "$net_devices_json" | jq -c \
-            --arg pci "$pci_addr" \
-            --arg vendor "$vendor" \
-            --arg desc "$description" \
-            --arg driver "$driver" \
-            --arg dver "$driver_version" \
-            --arg rev "$revision" \
-            --arg type "$dev_type" \
-            --argjson ifaces "$iface_json" \
-            '. += [{
-                PCI: $pci,
-                Vendor: $vendor,
-                Brand: $desc,
-                Driver: $driver,
-                DriverVersion: $dver,
-                Revision: $rev,
-                Type: $type,
-                Interfaces: $ifaces
-            }]')
-    done <<< "$pci_list"
-
-    # ----- Output Table -----
-    printf "%-14s | %-6s | %-10s | %-12s | %-40s | %-40s | %-30s\n" \
-        "PCI Address" "Type" "Driver" "Interface" "MAC Address" "Firmware" "Brand"
-    printf "%s\n" "------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
-
-    echo "$net_devices_json" | jq -r '
-        .[] as $dev |
-        ($dev.Interfaces[]? // {Interface:"-",MAC:"-",Firmware:"-"}) |
-        [
-            $dev.PCI,
-            $dev.Type,
-            $dev.Driver,
-            .Interface,
-            .MAC,
-            .Firmware,
-            $dev.Brand
-        ] | @tsv' |
-    while IFS=$'\t' read -r pci type driver iface mac fw brand; do
-        printf "%-14s | %-6s | %-10s | %-12s | %-40s | %-40s | %-30s\n" \
-            "$pci" "$type" "$driver" "$iface" "$mac" "$fw" "$brand"
-    done
-
-    # ----- Final JSON Output -----
-    net_json=$(jq -n --argjson devices "$net_devices_json" '{network_devices: $devices}')
-}
-
-fetch_hsi_info() {
-    header "4. High-Speed Interconnects (InfiniBand & NVSwitch)"
-    separator
-
-    local hsi_json='{"infini_band":[],"nv_switch":[]}'
-    
     #
-    # --------------------------------------------------------------------
-    # 1. DETECT INFINIBAND HCAs
-    # --------------------------------------------------------------------
+    # =====================================================================
+    # 1. ETHERNET & DPU DEVICES (PCI, lspci, ethtool)
+    # =====================================================================
+    #
+
+    if command -v lspci >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            local pci=$(echo "$line" | awk '{print $1}')
+            local desc=$(echo "$line" | cut -d' ' -f2-)
+
+            # Extract brand
+            local brand=$(echo "$desc" | sed 's/.*: //')
+
+            # Determine type (NIC vs DPU)
+            local type="NIC"
+            if echo "$desc" | grep -qiE "BlueField|SmartNIC|ConnectX.*DPU"; then
+                type="DPU"
+            fi
+
+            # Find network interfaces under this PCI dev
+            local netdir="/sys/bus/pci/devices/$pci/net"
+            if [[ -d "$netdir" ]]; then
+                for iface in "$netdir"/*; do
+                    iface=$(basename "$iface")
+                    local mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null)
+                    local driver=$(basename "$(readlink -f "/sys/class/net/$iface/device/driver")" 2>/dev/null)
+
+                    local fw="Unknown"
+                    if command -v ethtool >/dev/null 2>&1; then
+                        fw=$(ethtool -i "$iface" 2>/dev/null | awk -F': ' '/firmware-version/ {print $2}')
+                    fi
+
+                    ic_json=$(echo "$ic_json" | jq \
+                        --arg pci "$pci" \
+                        --arg brand "$brand" \
+                        --arg type "$type" \
+                        --arg iface "$iface" \
+                        --arg mac "$mac" \
+                        --arg driver "$driver" \
+                        --arg fw "$fw" \
+                        '
+                        .ethernet += [{
+                            pci: $pci,
+                            brand: $brand,
+                            type: $type,
+                            interface: $iface,
+                            mac: $mac,
+                            driver: $driver,
+                            firmware: $fw
+                        }]')
+                done
+            fi
+        done <<< "$(lspci -Dvmm | awk '/^Slot:/ {printf "%s ",$2} /^Class:/ {printf "%s ",$2} /^Vendor:/ {printf "%s ",$2} /^Device:/ {print $2}')"
+    else
+        warn "lspci missing — cannot enumerate Ethernet."
+    fi
+
+
+    #
+    # =====================================================================
+    # 2. INFINIBAND HCAs (full port introspection)
+    # =====================================================================
     #
 
     if [[ -d /sys/class/infiniband ]]; then
         for hca in /sys/class/infiniband/*; do
-            [[ ! -d "$hca" ]] && continue
             local name=$(basename "$hca")
 
             local fw=$(cat "$hca/fw_ver" 2>/dev/null || echo "Unknown")
-            local node_desc=$(cat "$hca/node_desc" 2>/dev/null || echo "Unknown")
-            local hca_type=$(cat "$hca/hca_type" 2>/dev/null || echo "Unknown")
+            local node=$(cat "$hca/node_desc" 2>/dev/null || echo "Unknown")
+            local htype=$(cat "$hca/hca_type" 2>/dev/null || echo "Unknown")
 
-            # Add base HCA record
-            hsi_json=$(echo "$hsi_json" | jq --arg n "$name" --arg fw "$fw" \
-                --arg nd "$node_desc" --arg ht "$hca_type" '
-                .infini_band += [{
+            ic_json=$(echo "$ic_json" | jq --arg n "$name" --arg fw "$fw" --arg nd "$node" --arg ht "$htype" '
+                .infiniband += [{
                     name: $n,
                     firmware: $fw,
                     node_desc: $nd,
@@ -573,20 +499,18 @@ fetch_hsi_info() {
                     ports: []
                 }]')
 
-            # Now find ports
             for port in "$hca/ports/"*; do
                 [[ ! -d "$port" ]] && continue
-                local pnum=$(basename "$port")
+                local pn=$(basename "$port")
 
-                local state=$(cat "$port/state" 2>/dev/null | awk '{print $2}' || echo "Unknown")
-                local phys_state=$(cat "$port/phys_state" 2>/dev/null | awk '{print $2}' || echo "Unknown")
-                local rate=$(cat "$port/rate" 2>/dev/null || echo "Unknown")
+                local state=$(awk '{print $2}' "$port/state" 2>/dev/null)
+                local phys=$(awk '{print $2}' "$port/phys_state" 2>/dev/null)
+                local rate=$(cat "$port/rate" 2>/dev/null)
 
-                # Attach port details
-                hsi_json=$(echo "$hsi_json" | jq \
-                    --arg n "$name" --arg pn "$pnum" \
-                    --arg st "$state" --arg ps "$phys_state" --arg rt "$rate" '
-                    .infini_band |=
+                ic_json=$(echo "$ic_json" | jq \
+                    --arg n "$name" --arg pn "$pn" \
+                    --arg st "$state" --arg ps "$phys" --arg rt "$rate" '
+                    .infiniband |=
                         map(if .name == $n then
                             .ports += [{
                                 port: $pn,
@@ -599,23 +523,26 @@ fetch_hsi_info() {
             done
         done
     else
-        warn "InfiniBand subsystem not present."
+        warn "No InfiniBand subsystem detected."
     fi
 
 
     #
-    # --------------------------------------------------------------------
-    # 2. DETECT NVSWITCH (DGX-A100/H100/GB200, HGX Nodes)
-    # --------------------------------------------------------------------
+    # =====================================================================
+    # 3. NVLINK / NVSWITCH (driver-dependent, safe checks)
+    # =====================================================================
     #
 
     if command -v nvidia-smi >/dev/null 2>&1; then
 
-        # Query basic switch list
-        local switch_info
-        switch_info=$(nvidia-smi --query-switch=index,uuid,family,model,firmware_version --format=csv,noheader 2>/dev/null)
+        #
+        # ---- A. NVSwitch Support Detection
+        #
+        if nvidia-smi --help | grep -q "query-switch"; then
 
-        if [[ -n "$switch_info" ]]; then
+            local swinfo
+            swinfo=$(nvidia-smi --query-switch=index,uuid,family,model,firmware_version --format=csv,noheader 2>/dev/null)
+
             while IFS=',' read -r idx uuid fam model fw; do
                 idx=$(echo "$idx" | xargs)
                 uuid=$(echo "$uuid" | xargs)
@@ -623,9 +550,10 @@ fetch_hsi_info() {
                 model=$(echo "$model" | xargs)
                 fw=$(echo "$fw" | xargs)
 
-                hsi_json=$(echo "$hsi_json" | jq \
-                    --arg idx "$idx" --arg uuid "$uuid" --arg fam "$fam" --arg model "$model" --arg fw "$fw" '
-                    .nv_switch += [{
+                ic_json=$(echo "$ic_json" | jq \
+                    --arg idx "$idx" --arg uuid "$uuid" --arg fam "$fam" \
+                    --arg model "$model" --arg fw "$fw" '
+                    .nvswitch += [{
                         index: $idx,
                         uuid: $uuid,
                         family: $fam,
@@ -633,16 +561,19 @@ fetch_hsi_info() {
                         firmware: $fw,
                         links: []
                     }]')
-            done <<< "$switch_info"
+            done <<< "$swinfo"
+        else
+            warn "NVSwitch API not supported on this system."
         fi
 
-        #
-        # Query NVLink topology per NVSwitch
-        #
-        local link_data
-        link_data=$(nvidia-smi nvlink --format=csv,noheader 2>/dev/null)
 
-        if [[ -n "$link_data" ]]; then
+        #
+        # ---- B. NVLink Topology
+        #
+        if nvidia-smi nvlink --help >/dev/null 2>&1; then
+            local ln
+            ln=$(nvidia-smi nvlink --format=csv,noheader 2>/dev/null)
+
             while IFS=',' read -r sw gpu link bw state; do
                 sw=$(echo "$sw" | xargs)
                 gpu=$(echo "$gpu" | xargs)
@@ -650,10 +581,10 @@ fetch_hsi_info() {
                 bw=$(echo "$bw" | xargs)
                 state=$(echo "$state" | xargs)
 
-                hsi_json=$(echo "$hsi_json" | jq \
+                ic_json=$(echo "$ic_json" | jq \
                     --arg sw "$sw" --arg gpu "$gpu" --arg link "$link" \
                     --arg bw "$bw" --arg st "$state" '
-                    .nv_switch |=
+                    .nvswitch |=
                         map(if .index == $sw then
                             .links += [{
                                 link: $link,
@@ -663,69 +594,94 @@ fetch_hsi_info() {
                             }]
                         else . end)
                 ')
-            done <<< "$link_data"
+            done <<< "$ln"
+        else
+            warn "NVLink API unsupported on this driver."
         fi
 
     else
-        warn "NVIDIA NVSwitch requires nvidia-smi."
+        warn "nvidia-smi not installed — skipping NVSwitch/NVLink."
     fi
 
+
+
     #
-    # --------------------------------------------------------------------
-    # PRINT HUMAN-READABLE TABLES
-    # --------------------------------------------------------------------
+    # =====================================================================
+    # 4. HUMAN-READABLE TABLE OUTPUT
+    # =====================================================================
     #
 
     echo ""
-    echo "InfiniBand HCAs:"
-    printf "%-10s | %-20s | %-20s | %-30s\n" "HCA" "Firmware" "Type" "Node Description"
-    echo "-------------------------------------------------------------------------------------------------------------"
+    echo "=== Ethernet / DPU Devices ==="
+    printf "%-12s | %-6s | %-12s | %-40s | %-20s | %-40s | %-35s\n" \
+        "PCI" "Type" "Driver" "Interface" "MAC" "Firmware" "Brand"
+    echo "------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
 
-    echo "$hsi_json" | jq -r '
-        .infini_band[] | [.name, .firmware, .hca_type, .node_desc] | @tsv' |
-        while IFS=$'\t' read -r n fw ht nd; do
-            printf "%-10s | %-20s | %-20s | %-30s\n" "$n" "$fw" "$ht" "$nd"
-        done
+    echo "$ic_json" | jq -r '.ethernet[] | [.pci,.type,.driver,.interface,.mac,.firmware,.brand] | @tsv' |
+    while IFS=$'\t' read -r pci type drv iface mac fw brand; do
+        printf "%-12s | %-6s | %-12s | %-40s | %-20s | %-40s | %-35s\n" \
+            "$pci" "$type" "$drv" "$iface" "$mac" "$fw" "$brand"
+    done
 
-    echo ""
-    echo "InfiniBand Ports:"
-    printf "%-10s | %-5s | %-10s | %-10s | %-10s\n" "HCA" "Port" "State" "PhysState" "Rate"
-    echo "-------------------------------------------------------------------"
-
-    echo "$hsi_json" | jq -r '
-        .infini_band[] as $hca |
-        $hca.ports[]? |
-        [$hca.name, .port, .state, .phys_state, .rate] | @tsv' |
-        while IFS=$'\t' read -r h p st ps rt; do
-            printf "%-10s | %-5s | %-10s | %-10s | %-10s\n" "$h" "$p" "$st" "$ps" "$rt"
-        done
 
     echo ""
-    echo "NVSwitch:"
-    printf "%-5s | %-40s | %-15s | %-25s\n" "Idx" "UUID" "Firmware" "Model"
-    echo "--------------------------------------------------------------------------"
+    echo "=== InfiniBand HCAs ==="
+    printf "%-12s | %-20s | %-20s | %-50s\n" "Name" "Firmware" "Type" "Node Description"
+    echo "------------------------------------------------------------------------------------------------------------------------------------------"
 
-    echo "$hsi_json" | jq -r '
-        .nv_switch[] | [.index, .uuid, .firmware, .model] | @tsv' |
-        while IFS=$'\t' read -r idx uuid fw model; do
-            printf "%-5s | %-40s | %-15s | %-25s\n" "$idx" "$uuid" "$fw" "$model"
-        done
+    echo "$ic_json" | jq -r '.infiniband[] | [.name,.firmware,.hca_type,.node_desc] | @tsv' |
+    while IFS=$'\t' read -r n fw typ nd; do
+        printf "%-12s | %-20s | %-20s | %-50s\n" "$n" "$fw" "$typ" "$nd"
+    done
+
 
     echo ""
-    echo "NVSwitch Links:"
-    printf "%-5s | %-5s | %-5s | %-12s | %-10s\n" "Sw" "Link" "GPU" "Bandwidth" "State"
-    echo "------------------------------------------------------------------"
+    echo "=== InfiniBand Ports ==="
+    printf "%-10s | %-5s | %-12s | %-12s | %-15s\n" "HCA" "Port" "State" "PhysState" "Rate"
+    echo "---------------------------------------------------------------------------"
 
-    echo "$hsi_json" | jq -r '
-        .nv_switch[] as $sw |
+    echo "$ic_json" | jq -r '
+        .infiniband[] as $h |
+        $h.ports[]? |
+        [$h.name,.port,.state,.phys_state,.rate] | @tsv' |
+    while IFS=$'\t' read -r h p st ps rt; do
+        printf "%-10s | %-5s | %-12s | %-12s | %-15s\n" "$h" "$p" "$st" "$ps" "$rt"
+    done
+
+
+    echo ""
+    echo "=== NVSwitch Devices ==="
+    printf "%-5s | %-40s | %-20s | %-25s\n" "Idx" "UUID" "Firmware" "Model"
+    echo "--------------------------------------------------------------------------------------------------"
+
+    echo "$ic_json" | jq -r '.nvswitch[] | [.index,.uuid,.firmware,.model] | @tsv' |
+    while IFS=$'\t' read -r idx uuid fw model; do
+        printf "%-5s | %-40s | %-20s | %-25s\n" "$idx" "$uuid" "$fw" "$model"
+    done
+
+
+    echo ""
+    echo "=== NVLink Links ==="
+    printf "%-5s | %-5s | %-5s | %-12s | %-12s\n" "Sw" "Link" "GPU" "Bandwidth" "State"
+    echo "-------------------------------------------------------------"
+
+    echo "$ic_json" | jq -r '
+        .nvswitch[] as $sw |
         $sw.links[]? |
-        [$sw.index, .link, .gpu, .bandwidth, .state] | @tsv' |
-        while IFS=$'\t' read -r s l g bw st; do
-            printf "%-5s | %-5s | %-5s | %-12s | %-10s\n" "$s" "$l" "$g" "$bw" "$st"
-        done
+        [$sw.index,.link,.gpu,.bandwidth,.state] | @tsv' |
+    while IFS=$'\t' read -r sw lk gpu bw st; do
+        printf "%-5s | %-5s | %-5s | %-12s | %-12s\n" "$sw" "$lk" "$gpu" "$bw" "$st"
+    done
 
-    hsi_data="$hsi_json"
+
+    #
+    # =====================================================================
+    # Export JSON
+    # =====================================================================
+    #
+    interconnect_json="$ic_json"
 }
+
 
 # =====================================================================
 #   RUNNING SEQUENCE
@@ -743,8 +699,12 @@ fetch_disk_info
 fetch_raid_info
 fetch_pci_info
 fetch_gpu_info
-fetch_network_info
-fetch_hsi_info
+
+### CLEANUP — removed calls to removed functions
+# fetch_network_info
+# fetch_hsi_info
+
+fetch_interconnect_info
 
 # =====================================================================
 #   JSON OUTPUT
@@ -758,7 +718,7 @@ canonical_json=$(jq -n \
     --argjson raid "$raid_json" \
     --argjson pci "$pci_json" \
     --argjson gpus "$gpu_json" \
-    --argjson net "$net_json" \
+    --argjson ic "$interconnect_json" \
     '{
         system: $sys,
         cpu: $cpu,
@@ -766,14 +726,14 @@ canonical_json=$(jq -n \
         storage: { disks: $disks, raid: $raid },
         pci: $pci,
         gpus: $gpus,
-        network: { interfaces: $net }
+        interconnects: $ic
     }'
 )
 
 if [[ $JSON_MODE -eq 1 ]]; then
     echo "$canonical_json"
 elif [[ $JSON_TREE_MODE -eq 1 ]]; then
-    echo "$canonical_json" | jq '{ hardware: { system: .system, cpu: .cpu, memory: .ram, storage: .storage, pci: .pci }, network: .network }'
+    echo "$canonical_json" | jq '{ hardware: { system: .system, cpu: .cpu, memory: .ram, storage: .storage, pci: .pci }, interconnects: .interconnects }'
 else
     log "\nScript completed successfully."
 fi
