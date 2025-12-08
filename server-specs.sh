@@ -144,6 +144,7 @@ validate() {
 	fetch_ram_info >/dev/null 2>&1
 	fetch_disk_info >/dev/null 2>&1
 	fetch_pci_info >/dev/null 2>&1
+	fetch_gpu_info >/dev/null 2>&1
 	fetch_network_info >/dev/null 2>&1
 
 	# Basic sanity:
@@ -274,6 +275,7 @@ ram_devices_json="[]"
 disks_json="[]"
 raid_json="{}"
 pci_json="[]"
+gpu_json="[]"
 net_json="[]"
 
 # =====================================================================
@@ -480,6 +482,47 @@ fetch_pci_info() {
 }
 
 # =====================================================================
+#   SECTION 6.1: GPU
+# =====================================================================
+fetch_gpu_info() {
+    header "6.1. GPU Information"
+    separator
+
+    gpu_json="[]"
+
+    if has nvidia-smi; then
+        # NVIDIA GPUs: PCI bus ID, model, UUID (as serial)
+        while IFS= read -r line; do
+            model=$(echo "$line" | awk -F',' '{print $1}' | xargs)
+            serial=$(echo "$line" | awk -F',' '{print $2}' | xargs)  # UUID
+            pci=$(echo "$line" | awk -F',' '{print $3}' | xargs)
+
+            echo "GPU Model: $model"
+            echo "PCI ID:    $pci"
+            echo "Serial:    $serial"
+
+            gpu_json=$(echo "$gpu_json" | jq --arg model "$model" --arg pci "$pci" --arg serial "$serial" \
+                '. += [{model: $model, pci: $pci, serial: $serial}]')
+        done < <(nvidia-smi --query-gpu=name,uuid,pci.bus_id --format=csv,noheader,nounits)
+    else
+        # Generic PCI VGA devices
+        while IFS= read -r line; do
+            pci=$(echo "$line" | awk '{print $1}')
+            model=$(echo "$line" | cut -d' ' -f2-)
+            serial=""  # Serial unknown for generic GPUs
+
+            echo "GPU Model: $model"
+            echo "PCI ID:    $pci"
+            echo "Serial:    $serial"
+
+            gpu_json=$(echo "$gpu_json" | jq --arg model "$model" --arg pci "$pci" --arg serial "$serial" \
+                '. += [{model: $model, pci: $pci, serial: $serial}]')
+        done < <(lspci | grep -i VGA)
+    fi
+}
+
+
+# =====================================================================
 #   SECTION 7: NETWORK (subshell JSON fix)
 # =====================================================================
 fetch_network_info() {
@@ -515,6 +558,7 @@ fetch_ram_info
 fetch_disk_info
 fetch_raid_info
 fetch_pci_info
+fetch_gpu_info
 fetch_network_info
 
 # =====================================================================
@@ -530,6 +574,7 @@ canonical_json=$(jq -n \
     --argjson disks "$disks_json" \
     --argjson raid "$raid_json" \
     --argjson pci "$pci_json" \
+    --argjson gpus "$gpu_json" \
     --argjson net "$net_json" \
     '{
         system: $sys,
@@ -543,6 +588,7 @@ canonical_json=$(jq -n \
             raid: $raid
         },
         pci: $pci,
+	gpus: $gpus,
         network: {
             interfaces: $net
         }
