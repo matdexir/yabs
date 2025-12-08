@@ -57,6 +57,35 @@ esac
 # ---------------------------
 has() { command -v "$1" >/dev/null 2>&1; }
 
+check_tools() {
+    declare -A required_tools=(
+        ["dmidecode"]="DMI tables"
+        ["lscpu"]="CPU info"
+        ["smartctl"]="Disk SMART info"
+        ["lspci"]="PCI devices"
+        ["ip"]="Network interfaces"
+        ["jq"]="JSON processing"
+    )
+
+    missing=()
+    for tool in "${!required_tools[@]}"; do
+        if ! has "$tool"; then
+            missing+=("$tool")
+        fi
+    done
+
+    if [ ${#missing[@]} -ne 0 ]; then
+        echo -e "${RED}Error: Missing required tools:${NC}"
+        for t in "${missing[@]}"; do
+            echo -e "  - $t (needed for: ${required_tools[$t]})"
+        done
+        echo -e "${RED}Aborting script execution.${NC}"
+        exit 1
+    fi
+}
+
+
+
 validate() {
 	echo -e "${BLUE}VALIDATION MODE – Environment & Capability Check${NC}"
 	separator
@@ -473,9 +502,13 @@ fetch_network_info() {
 # If validation mode requested, run only validator and exit
 if [[ $VALIDATE_MODE -eq 1 ]]; then
 	validate
+	if [[ $? -ne 0 ]]; then
+		error "Critical tools or permissions missing. Exiting."
+	fi
 	exit 0
 fi
 
+check_tools
 fetch_system_info
 fetch_cpu_info
 fetch_ram_info
