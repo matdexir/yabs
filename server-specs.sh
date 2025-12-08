@@ -5,6 +5,9 @@
 #   Portable across all major Linux distros
 # ============================================================
 
+export LANG=C
+set -o pipefail
+
 # ---------------------------
 #   COLOR DEFINITIONS
 # ---------------------------
@@ -27,24 +30,9 @@ cat << EOF
 Usage: $0 [OPTIONS]
 
 Options:
-  --json        Output hardware information in namespaced JSON format (Option B)
-  --json-tree   Output hardware information as hierarchical JSON tree (Option C)
+  --json        Output hardware information in namespaced JSON format
+  --json-tree   Output hardware information as hierarchical JSON tree
   -h, --help    Show this help menu and exit
-
-Description:
-  This script gathers comprehensive hardware information including:
-    - System & BIOS
-    - CPU
-    - RAM (with DIMM hardware details)
-    - Disks (with SMART identity)
-    - RAID (software & hardware)
-    - PCI devices
-    - Network interfaces
-
-Examples:
-  $0                     Display human-readable hardware report
-  $0 --json              Export hardware info in namespaced JSON
-  $0 --json-tree         Export hardware info as a hierarchical JSON tree
 
 EOF
 exit 0
@@ -63,27 +51,6 @@ case "$1" in
 esac
 
 # ---------------------------
-#   JSON HELPERS
-# ---------------------------
-JSON="{}"
-
-json_escape() {
-    echo "$1" | sed 's/"/\\"/g'
-}
-
-json_set() {
-    local key="$1"
-    local val="$2"
-    JSON=$(echo "$JSON" | jq --arg k "$key" --arg v "$val" '.[$k] = $v')
-}
-
-json_set_raw() {
-    local key="$1"
-    local raw="$2"
-    JSON=$(echo "$JSON" | jq --arg k "$key" -n --slurpfile base <(echo "$JSON") "$raw | . as \$v | \$base[0] + { ($k): \$v }")
-}
-
-# ---------------------------
 #   TOOL CHECKER
 # ---------------------------
 has() { command -v "$1" >/dev/null 2>&1; }
@@ -91,14 +58,31 @@ has() { command -v "$1" >/dev/null 2>&1; }
 # ---------------------------
 #   GLOBALS
 # ---------------------------
-SUDO="sudo"
-$SUDO -v 2>/dev/null
+if [[ $EUID -eq 0 ]]; then
+    SUDO=""
+elif has sudo; then
+    SUDO="sudo"
+    $SUDO -n true 2>/dev/null || warn "sudo password may be required"
+else
+    SUDO=""
+    warn "Not root and sudo not available — some information will be missing"
+fi
+
+# ---------------------------
+#   GLOBAL JSON OBJECTS
+# ---------------------------
+system_info_json="{}"
+cpu_json="{}"
+ram_json="{}"
+ram_devices_json="[]"
+disks_json="[]"
+raid_json="{}"
+pci_json="[]"
+net_json="[]"
 
 # =====================================================================
 #   SECTION 1: SYSTEM & BIOS
 # =====================================================================
-system_info_json="{}"
-
 fetch_system_info() {
     header "1. System Information"
     separator
@@ -106,14 +90,14 @@ fetch_system_info() {
     local vendor="" product="" serial="" uuid="" bios_vendor="" bios_version="" bios_date=""
 
     if has dmidecode; then
-        vendor=$($SUDO dmidecode -s system-manufacturer 2>/dev/null)
-        product=$($SUDO dmidecode -s system-product-name 2>/dev/null)
-        serial=$($SUDO dmidecode -s system-serial-number 2>/dev/null)
-        uuid=$($SUDO dmidecode -s system-uuid 2>/dev/null)
+        vendor=$($SUDO dmidecode -s system-manufacturer 2>/dev/null || true)
+        product=$($SUDO dmidecode -s system-product-name 2>/dev/null || true)
+        serial=$($SUDO dmidecode -s system-serial-number 2>/dev/null || true)
+        uuid=$($SUDO dmidecode -s system-uuid 2>/dev/null || true)
 
-        bios_vendor=$($SUDO dmidecode -s bios-vendor 2>/dev/null)
-        bios_version=$($SUDO dmidecode -s bios-version 2>/dev/null)
-        bios_date=$($SUDO dmidecode -s bios-release-date 2>/dev/null)
+        bios_vendor=$($SUDO dmidecode -s bios-vendor 2>/dev/null || true)
+        bios_version=$($SUDO dmidecode -s bios-version 2>/dev/null || true)
+        bios_date=$($SUDO dmidecode -s bios-release-date 2>/dev/null || true)
     else
         warn "dmidecode missing – system info limited."
     fi
@@ -141,8 +125,6 @@ fetch_system_info() {
 # =====================================================================
 #   SECTION 2: CPU
 # =====================================================================
-cpu_json="{}"
-
 fetch_cpu_info() {
     header "2. CPU Information"
     separator
@@ -175,19 +157,28 @@ fetch_cpu_info() {
 }
 
 # =====================================================================
-#   SECTION 3: RAM (with full DIMM detail)
+#   SECTION 3: RAM (DIMM fix + total/max fix)
 # =====================================================================
-ram_json="{}"
-ram_devices_json="[]"
-
 fetch_ram_info() {
     header "3. RAM Information"
     separator
 
-    local total="" maxcap=""
-    if has lshw; then
-        total=$($SUDO lshw -class memory | awk '/size:/ {print $2 $3; exit}')
-        maxcap=$($SUDO lshw -class memory | awk '/capacity:/ {print $2 $3; exit}')
+    local total="0 MB" maxcap="Unknown"
+
+    if has dmidecode; then
+        maxcap=$(
+            $SUDO dmidecode -t memory |
+            awk -F: '/Maximum Capacity/ {print $2}' | xargs
+        )
+
+        total=$(
+            $SUDO dmidecode -t memory |
+            awk -F: '/Size:/ && $2 ~ /[0-9]/ {print $2}' |
+            awk '
+                /MB/ {sum+=$1}
+                /GB/ {sum+=($1*1024)}
+                END {print sum " MB"}'
+        )
     fi
 
     echo "Total System RAM:       $total"
@@ -197,10 +188,13 @@ fetch_ram_info() {
     ram_json=$(jq -n --arg total "$total" --arg maxcap "$maxcap" \
         '{ total: $total, max_supported: $maxcap }')
 
+    # DIMM details (patched parser)
+    ram_devices_json="[]"
+
     if has dmidecode; then
-        local dev_json
-        while read -r block; do
-            [ -z "$block" ] && continue
+        while IFS= read -r block; do
+            [[ -z "$block" ]] && continue
+
             dev_json=$(echo "$block" | jq -Rn '
                 (input | split("\n")) as $lines |
                 reduce $lines[] as $l ({}; 
@@ -209,34 +203,28 @@ fetch_ram_info() {
                       . + { ($kv[0] | gsub(" "; "_")): ($kv[1]) }
                     else . end
                 )')
+
             ram_devices_json=$(echo "$ram_devices_json" | jq --argjson d "$dev_json" '. += [$d]')
-        done < <($SUDO dmidecode -t memory |
-            awk '
-                /Memory Device$/ { if (NR>1) print ""; next }
-                /Size:|Locator:|Bank Locator:|Type:|Type Detail:|Speed:|Configured Clock Speed:|Manufacturer:|Serial Number:|Part Number:|Rank:|Form Factor:/ {
-                    gsub(/^[ \t]+/,""); print $0
-                }')
+
+        done < <($SUDO dmidecode -t memory | awk '/Memory Device$/,/^$/' | sed '/^Memory Device$/d')
     fi
 }
 
 # =====================================================================
-#   SECTION 4: DISKS
+#   SECTION 4: DISKS (NVMe fix + glob safety)
 # =====================================================================
-disks_json="[]"
-
 fetch_disk_info() {
     header "4. Disk Information"
     separator
 
-    local disk model serial fw cap rpm
+    disks_json="[]"
 
-    for disk in /dev/sd? /dev/hd? /dev/nvme?n?; do
+    for disk in /dev/sd? /dev/hd? /dev/nvme*[0-9]n[0-9]*; do
         [ -b "$disk" ] || continue
 
-        model="" serial="" fw="" cap="" rpm=""
-
+        local model="" serial="" fw="" cap="" rpm="" info=""
         if has smartctl; then
-            info=$($SUDO smartctl -i "$disk" 2>/dev/null)
+            info=$($SUDO smartctl -i "$disk" 2>/dev/null || true)
             model=$(echo "$info" | awk -F: '/Device Model|Model Number/ {print $2}' | xargs)
             serial=$(echo "$info" | awk -F: '/Serial Number/ {print $2}' | xargs)
             fw=$(echo "$info" | awk -F: '/Firmware Version/ {print $2}' | xargs)
@@ -262,54 +250,53 @@ fetch_disk_info() {
 # =====================================================================
 #   SECTION 5: RAID
 # =====================================================================
-raid_json="{}"
-
 fetch_raid_info() {
     header "5. RAID Information"
     separator
-    local mdstat active="" arrays=""
+
+    local mdstat=""
 
     if [ -r /proc/mdstat ]; then
         mdstat=$(cat /proc/mdstat)
         echo "$mdstat"
-
-        arrays=$(echo "$mdstat" | awk '/^md/ {print $1}')
+    else
+        warn "Cannot read /proc/mdstat"
     fi
 
     raid_json=$(jq -n --arg md "$mdstat" '{ mdstat: $md }')
 }
 
 # =====================================================================
-#   SECTION 6: PCI DEVICES
+#   SECTION 6: PCI (subshell JSON fix)
 # =====================================================================
-pci_json="[]"
-
 fetch_pci_info() {
     header "6. PCI Devices"
     separator
 
+    pci_json="[]"
+
     if has lspci; then
-        lspci | while read -r line; do
+        while IFS= read -r line; do
             echo "$line"
             pci_json=$(echo "$pci_json" | jq --arg l "$line" '. += [$l]')
-        done
+        done < <(lspci)
     fi
 }
 
 # =====================================================================
-#   SECTION 7: NETWORK
+#   SECTION 7: NETWORK (subshell JSON fix)
 # =====================================================================
-net_json="[]"
-
 fetch_network_info() {
     header "7. Network Interfaces"
     separator
 
+    net_json="[]"
+
     if has ip; then
-        ip -br a | while read -r line; do
+        while IFS= read -r line; do
             echo "$line"
             net_json=$(echo "$net_json" | jq --arg l "$line" '. += [$l]')
-        done
+        done < <(ip -br a)
     fi
 }
 
@@ -325,45 +312,54 @@ fetch_pci_info
 fetch_network_info
 
 # =====================================================================
-#   JSON OUTPUT
+#   JSON OUTPUT (Unified Internal Structure)
 # =====================================================================
-if [[ $JSON_MODE -eq 1 || $JSON_TREE_MODE -eq 1 ]]; then
 
-    if [[ $JSON_MODE -eq 1 ]]; then
-        # -------- JSON MODE B (namespaced/CMDB style) --------
-        final=$(jq -n \
-            --argjson sys "$system_info_json" \
-            --argjson cpu "$cpu_json" \
-            --argjson ram "$ram_json" \
-            --argjson ramdev "$ram_devices_json" \
-            --argjson disks "$disks_json" \
-            --argjson raid "$raid_json" \
-            --argjson pci "$pci_json" \
-            --argjson net "$net_json" \
-            '{ system: $sys, cpu: $cpu, ram: $ram, ram_devices: $ramdev,
-               disks: $disks, raid: $raid, pci: $pci, network: $net }')
-    else
-        # -------- JSON MODE C (hierarchical tree) --------
-        final=$(jq -n \
-            --argjson sys "$system_info_json" \
-            --argjson cpu "$cpu_json" \
-            --argjson ramdev "$ram_devices_json" \
-            --argjson disks "$disks_json" \
-            --argjson raid "$raid_json" \
-            --argjson pci "$pci_json" \
-            --argjson net "$net_json" \
-            '{
-               hardware: {
-                   system: $sys,
-                   cpu: $cpu,
-                   memory: { dimms: $ramdev },
-                   storage: { disks: $disks, raid: $raid },
-                   pci: $pci
-               },
-               network: { interfaces: $net }
-             }')
-    fi
+# Canonical master JSON object:
+canonical_json=$(jq -n \
+    --argjson sys "$system_info_json" \
+    --argjson cpu "$cpu_json" \
+    --argjson ram "$ram_json" \
+    --argjson dimms "$ram_devices_json" \
+    --argjson disks "$disks_json" \
+    --argjson raid "$raid_json" \
+    --argjson pci "$pci_json" \
+    --argjson net "$net_json" \
+    '{
+        system: $sys,
+        cpu: $cpu,
+        ram: {
+            summary: $ram,
+            dimms: $dimms
+        },
+        storage: {
+            disks: $disks,
+            raid: $raid
+        },
+        pci: $pci,
+        network: {
+            interfaces: $net
+        }
+    }'
+)
 
+if [[ $JSON_MODE -eq 1 ]]; then
+    # Output canonical object (namespaced CMDB style)
+    echo "$canonical_json"
+    exit 0
+elif [[ $JSON_TREE_MODE -eq 1 ]]; then
+    # Render hierarchical view using the canonical object
+    final=$(echo "$canonical_json" | jq '
+    {
+        hardware: {
+            system: .system,
+            cpu: .cpu,
+            memory: .ram,
+            storage: .storage,
+            pci: .pci
+        },
+        network: .network
+    }')
     echo "$final"
     exit 0
 fi
