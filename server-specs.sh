@@ -104,7 +104,7 @@ ram_json="{}"
 ram_devices_json="[]"
 disks_json="[]"
 raid_json="{}"
-pci_json="[]"
+other_pci_json="[]"
 gpu_json="[]"
 interconnect_json="{}"
 
@@ -368,18 +368,6 @@ fetch_raid_info() {
 #   SECTION 6: PCI & GPU
 # =====================================================================
 
-fetch_pci_info() {
-    header "6. PCI Devices"
-    separator
-
-    pci_json="[]"
-    if has lspci; then
-        while IFS= read -r line; do
-            echo "$line"
-            pci_json=$(echo "$pci_json" | jq --arg l "$line" '. += [$l]')
-        done < <(lspci)
-    fi
-}
 
 fetch_gpu_info() {
     header "6.1. GPU Information"
@@ -405,10 +393,31 @@ fetch_gpu_info() {
     fi
 }
 
+fetch_other_pci_info(){
+    header "6.2 Other PCI Devices"
+    separator
+
+    if has lspci; then
+        local pcis=$(lspci | grep -vi 'vga\|3d\|2d')
+        if [[ -n "$pcis" ]]; then
+            printf "%-10s | %-50s\n" "Slot" "Description"
+            printf "%s\n" "-------------------------------------------------------------"
+            while read -r line; do
+                local slot=$(echo "$line" | awk '{print $1}')
+                local desc=$(echo "$line" | cut -d' ' -f2-)
+                printf "%-10s | %-50s\n" "$slot" "$desc"
+                other_pci_json=$(echo "$other_pci_json" | jq -c --arg slot "$slot" --arg desc "$desc" '. += [{slot: $slot, description: $desc}]')
+            done <<< "$pcis"
+        else
+            echo "No other PCI devices detected."
+        fi
+    else
+        warn "lspci missing – PCI info limited."
+    fi
+}
+
 # =====================================================================
-#   SECTION 7: HIGH-SPEED INTERCONNECTS (replacement)
-#   fetch_network_info() and fetch_hsi_info() removed; replaced by
-#   your consolidated fetch_interconnect_info()
+#   SECTION 7: HIGH-SPEED INTERCONNECTS
 # =====================================================================
 fetch_interconnect_info() {
 
@@ -697,12 +706,8 @@ fetch_cpu_info
 fetch_ram_info
 fetch_disk_info
 fetch_raid_info
-fetch_pci_info
 fetch_gpu_info
-
-### CLEANUP — removed calls to removed functions
-# fetch_network_info
-# fetch_hsi_info
+fetch_other_pci_info
 
 fetch_interconnect_info
 
@@ -716,7 +721,7 @@ canonical_json=$(jq -n \
     --argjson dimms "$ram_devices_json" \
     --argjson disks "$disks_json" \
     --argjson raid "$raid_json" \
-    --argjson pci "$pci_json" \
+    --argjson pci "$other_pci_json" \
     --argjson gpus "$gpu_json" \
     --argjson ic "$interconnect_json" \
     '{
