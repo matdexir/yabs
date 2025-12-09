@@ -352,13 +352,36 @@ fetch_disk_info() {
     }
 
     # --------------------------------------------
+    # Helper: check RAID membership
+    # --------------------------------------------
+    is_raid_member() {
+        local disk="$1"
+        # sysfs md directory
+        if [ -d "/sys/block/$(basename "$disk")/md" ]; then
+            echo "yes"
+            return
+        fi
+        # udev property
+        if udevadm info --query=all --name="$disk" 2>/dev/null | grep -q "linux_raid_member"; then
+            echo "yes"
+            return
+        fi
+        # mdadm superblock
+        if sudo mdadm --examine "$disk" &>/dev/null; then
+            echo "yes"
+            return
+        fi
+        echo "no"
+    }
+
+    # --------------------------------------------
     # Enumerate *real block disks*, not partitions
     # --------------------------------------------
     for sysdev in /sys/block/*; do
         devname=$(basename "$sysdev")
         disk="/dev/$devname"
 
-        # Accept only disk devices, not partitions
+        # Accept only disk devices, no partitions
         case "$disk" in
             /dev/sd*|/dev/hd*|/dev/nvme*n*) ;;
             *) continue ;;
@@ -367,15 +390,22 @@ fetch_disk_info() {
         # Skip loop devices
         [[ "$devname" == loop* ]] && continue
 
-        local model="" serial="" fw="" cap="" rpm="" info="" info_full=""
+        local model="" serial="" fw="" cap="" rpm="" info="" smart_ok=false raid="no"
 
         # --------------------------------------------
-        # SMARTCTL Info
+        # SMART detection
         # --------------------------------------------
         if has smartctl; then
-            info=$(get_smart_info "$disk" || true)
+            if get_smart_info "$disk" &>/dev/null; then
+                smart_ok=true
+                info=$(get_smart_info "$disk")
+            fi
+        fi
 
-            # Parse basic device info
+        # --------------------------------------------
+        # Parse info if SMART available
+        # --------------------------------------------
+        if [ "$smart_ok" = true ] && [ -n "$info" ]; then
             model=$(echo "$info" | awk -F: '/Device Model|Model Number/ {print $2}' | xargs)
             serial=$(echo "$info" | awk -F: '/Serial Number/ {print $2}' | xargs)
             fw=$(echo "$info" | awk -F: '/Firmware Version/ {print $2}' | xargs)
@@ -388,21 +418,29 @@ fetch_disk_info() {
             # Rotation Rate
             rpm=$(echo "$info" | awk -F: '/Rotation Rate/ {print $2}' | xargs)
 
-            # Grab full SMART dump for fallback
+            # Full SMART dump fallback for RPM
             info_full=$($SUDO smartctl -a "$disk" 2>/dev/null)
             [ -z "$rpm" ] && rpm=$(echo "$info_full" | awk -F: '/Rotation Rate/ {print $2}' | xargs)
         fi
 
         # --------------------------------------------
-        # hdparm fallback for SATA RPM
+        # Fallbacks when SMART unsupported
         # --------------------------------------------
-        if [ -z "$rpm" ] && has hdparm && [[ "$disk" == /dev/sd* ]]; then
-            hdinfo=$(sudo hdparm -I "$disk" 2>/dev/null)
-            rpm=$(echo "$hdinfo" | awk '/RPM/ {print $1}' | xargs)
+        if [ "$smart_ok" = false ] || [ -z "$model" ]; then
+            model=$(udevadm info --query=property --name="$disk" 2>/dev/null | grep '^ID_MODEL=' | cut -d= -f2)
+            serial=$(udevadm info --query=property --name="$disk" 2>/dev/null | grep '^ID_SERIAL=' | cut -d= -f2)
         fi
 
         # --------------------------------------------
-        # Determine SSD vs HDD via sysfs if RPM missing
+        # Capacity fallback via blockdev
+        # --------------------------------------------
+        if [ -z "$cap" ] && has blockdev; then
+            bytes=$(blockdev --getsize64 "$disk" 2>/dev/null)
+            [ -n "$bytes" ] && cap="$(numfmt --to=iec --suffix=B "$bytes")"
+        fi
+
+        # --------------------------------------------
+        # RPM / SSD detection fallback
         # --------------------------------------------
         if [ -z "$rpm" ]; then
             if [[ "$disk" == /dev/nvme* ]]; then
@@ -417,15 +455,16 @@ fetch_disk_info() {
             fi
         fi
 
-        # --------------------------------------------
-        # Capacity fallback via blockdev
-        # --------------------------------------------
-        if [ -z "$cap" ] && has blockdev; then
-            bytes=$(blockdev --getsize64 "$disk" 2>/dev/null)
-            if [ -n "$bytes" ]; then
-                cap="$(numfmt --to=iec --suffix=B "$bytes")"
-            fi
+        # hdparm fallback for SATA RPM
+        if [ "$rpm" = "Unknown" ] && has hdparm && [[ "$disk" == /dev/sd* ]]; then
+            hdinfo=$(sudo hdparm -I "$disk" 2>/dev/null)
+            rpm=$(echo "$hdinfo" | awk '/RPM/ {print $1}' | xargs)
         fi
+
+        # --------------------------------------------
+        # RAID detection
+        # --------------------------------------------
+        raid=$(is_raid_member "$disk")
 
         # --------------------------------------------
         # Pretty print output
@@ -436,6 +475,7 @@ fetch_disk_info() {
         echo -e "  FW:     $fw"
         echo -e "  Size:   $cap"
         echo -e "  RPM:    $rpm"
+        echo -e "  RAID:   $raid"
 
         # --------------------------------------------
         # JSON append
@@ -447,13 +487,15 @@ fetch_disk_info() {
             --arg fw "$fw" \
             --arg cap "$cap" \
             --arg rpm "$rpm" \
+            --arg raid "$raid" \
             '. += [{
                 disk: $disk,
                 model: $model,
                 serial: $serial,
                 firmware: $fw,
                 capacity: $cap,
-                rotation_rate: $rpm
+                rotation_rate: $rpm,
+                raid: $raid
             }]')
     done
 
