@@ -26,7 +26,7 @@ This script relies on several standard Linux utilities, some of which require ro
 - smartctl
 - lspci
 - lshw
-- ip
+- jq
 
 
 > Note: The script uses sudo for commands like dmidecode, smartctl, and lshw. Ensure your user has the necessary permissions.
