@@ -330,64 +330,71 @@ fetch_disk_info() {
     disks_json="[]"
 
     # --------------------------------------------
-    # Helper: detect correct smartctl device type
+    # Helper: determine correct smartctl invocation
     # --------------------------------------------
     get_smart_info() {
         local disk="$1"
 
-        # NVMe devices
+        # NVMe drives require nvme device type
         if [[ "$disk" == /dev/nvme* ]]; then
             $SUDO smartctl -i -d nvme "$disk" 2>/dev/null && return 0
         fi
 
-        # USB-to-SATA adapters — need '-d sat'
+        # USB-to-SATA adapters often need -d sat
         if udevadm info --query=all --name "$disk" 2>/dev/null | grep -q "ID_BUS=usb"; then
             $SUDO smartctl -i -d sat "$disk" 2>/dev/null && return 0
         fi
 
-        # Classic SATA/SAS
+        # Default SATA/SAS
         $SUDO smartctl -i "$disk" 2>/dev/null && return 0
 
         return 1
     }
 
     # --------------------------------------------
-    # Loop through major disk block devices
+    # Enumerate *real block disks*, not partitions
     # --------------------------------------------
-    for disk in /dev/sd? /dev/hd? /dev/nvme*[0-9]n[0-9]*; do
-        [ -b "$disk" ] || continue
+    for sysdev in /sys/block/*; do
+        devname=$(basename "$sysdev")
+        disk="/dev/$devname"
 
-        local model="" serial="" fw="" cap="" rpm="" info=""
+        # Accept only disk devices, not partitions
+        case "$disk" in
+            /dev/sd*|/dev/hd*|/dev/nvme*n*) ;;
+            *) continue ;;
+        esac
+
+        # Skip loop devices
+        [[ "$devname" == loop* ]] && continue
+
+        local model="" serial="" fw="" cap="" rpm="" info="" info_full=""
 
         # --------------------------------------------
-        # SMARTCTL primary detection
+        # SMARTCTL Info
         # --------------------------------------------
         if has smartctl; then
             info=$(get_smart_info "$disk" || true)
 
-            # SATA + NVMe model fields
+            # Parse basic device info
             model=$(echo "$info" | awk -F: '/Device Model|Model Number/ {print $2}' | xargs)
-
             serial=$(echo "$info" | awk -F: '/Serial Number/ {print $2}' | xargs)
             fw=$(echo "$info" | awk -F: '/Firmware Version/ {print $2}' | xargs)
 
-            # Multiple capacity formats
+            # Capacity (multiple possible fields)
             cap=$(echo "$info" | awk -F: '/User Capacity/ {print $2}' | xargs)
             [ -z "$cap" ] && cap=$(echo "$info" | awk -F: '/Total NVM Capacity/ {print $2}' | xargs)
             [ -z "$cap" ] && cap=$(echo "$info" | awk -F: '/Namespace [0-9]+ Size/ {print $2}' | xargs)
 
-            # RPM (HDD only)
+            # Rotation Rate
             rpm=$(echo "$info" | awk -F: '/Rotation Rate/ {print $2}' | xargs)
 
-            # Fallback: full SMART dump
-            if [ -z "$rpm" ]; then
-                info_full=$($SUDO smartctl -a "$disk" 2>/dev/null)
-                rpm=$(echo "$info_full" | awk -F: '/Rotation Rate/ {print $2}' | xargs)
-            fi
+            # Grab full SMART dump for fallback
+            info_full=$($SUDO smartctl -a "$disk" 2>/dev/null)
+            [ -z "$rpm" ] && rpm=$(echo "$info_full" | awk -F: '/Rotation Rate/ {print $2}' | xargs)
         fi
 
         # --------------------------------------------
-        # Try hdparm for SATA disks (RPM)
+        # hdparm fallback for SATA RPM
         # --------------------------------------------
         if [ -z "$rpm" ] && has hdparm && [[ "$disk" == /dev/sd* ]]; then
             hdinfo=$(sudo hdparm -I "$disk" 2>/dev/null)
@@ -395,13 +402,13 @@ fetch_disk_info() {
         fi
 
         # --------------------------------------------
-        # If still unknown, detect SSD/HDD through sysfs
+        # Determine SSD vs HDD via sysfs if RPM missing
         # --------------------------------------------
         if [ -z "$rpm" ]; then
             if [[ "$disk" == /dev/nvme* ]]; then
                 rpm="SSD"
             else
-                rotational=$(cat /sys/block/"$(basename "$disk")"/queue/rotational 2>/dev/null)
+                rotational=$(cat "/sys/block/$devname/queue/rotational" 2>/dev/null)
                 if [ "$rotational" = "0" ]; then
                     rpm="SSD"
                 elif [ "$rotational" = "1" ]; then
@@ -411,15 +418,17 @@ fetch_disk_info() {
         fi
 
         # --------------------------------------------
-        # Fallback for capacity (blockdev)
+        # Capacity fallback via blockdev
         # --------------------------------------------
         if [ -z "$cap" ] && has blockdev; then
             bytes=$(blockdev --getsize64 "$disk" 2>/dev/null)
-            [ -n "$bytes" ] && cap="$(numfmt --to=iec --suffix=B "$bytes")"
+            if [ -n "$bytes" ]; then
+                cap="$(numfmt --to=iec --suffix=B "$bytes")"
+            fi
         fi
 
         # --------------------------------------------
-        # Output
+        # Pretty print output
         # --------------------------------------------
         echo -e "${CYAN}$disk${NC}"
         echo -e "  Model:  $model"
@@ -429,7 +438,7 @@ fetch_disk_info() {
         echo -e "  RPM:    $rpm"
 
         # --------------------------------------------
-        # JSON output
+        # JSON append
         # --------------------------------------------
         disks_json=$(echo "$disks_json" | jq \
             --arg disk "$disk" \
