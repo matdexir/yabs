@@ -104,7 +104,7 @@ ram_json="{}"
 ram_devices_json="[]"
 disks_json="[]"
 raid_json="{}"
-pci_json="[]"
+other_pci_json="[]"
 gpu_json="[]"
 interconnect_json="{}"
 
@@ -328,21 +328,178 @@ fetch_disk_info() {
     separator
 
     disks_json="[]"
-    for disk in /dev/sd? /dev/hd? /dev/nvme*[0-9]n[0-9]*; do
-        [ -b "$disk" ] || continue
-        local model="" serial="" fw="" cap="" rpm="" info=""
+
+    # --------------------------------------------
+    # Helper: determine correct smartctl invocation
+    # --------------------------------------------
+    get_smart_info() {
+        local disk="$1"
+
+        # NVMe drives require nvme device type
+        if [[ "$disk" == /dev/nvme* ]]; then
+            $SUDO smartctl -i -d nvme "$disk" 2>/dev/null && return 0
+        fi
+
+        # USB-to-SATA adapters often need -d sat
+        if udevadm info --query=all --name "$disk" 2>/dev/null | grep -q "ID_BUS=usb"; then
+            $SUDO smartctl -i -d sat "$disk" 2>/dev/null && return 0
+        fi
+
+        # Default SATA/SAS
+        $SUDO smartctl -i "$disk" 2>/dev/null && return 0
+
+        return 1
+    }
+
+    # --------------------------------------------
+    # Helper: check RAID membership
+    # --------------------------------------------
+    is_raid_member() {
+        local disk="$1"
+        # sysfs md directory
+        if [ -d "/sys/block/$(basename "$disk")/md" ]; then
+            echo "yes"
+            return
+        fi
+        # udev property
+        if udevadm info --query=all --name="$disk" 2>/dev/null | grep -q "linux_raid_member"; then
+            echo "yes"
+            return
+        fi
+        # mdadm superblock
+        if sudo mdadm --examine "$disk" &>/dev/null; then
+            echo "yes"
+            return
+        fi
+        echo "no"
+    }
+
+    # --------------------------------------------
+    # Enumerate *real block disks*, not partitions
+    # --------------------------------------------
+    for sysdev in /sys/block/*; do
+        devname=$(basename "$sysdev")
+        disk="/dev/$devname"
+
+        # Accept only disk devices, no partitions
+        case "$disk" in
+            /dev/sd*|/dev/hd*|/dev/nvme*n*) ;;
+            *) continue ;;
+        esac
+
+        # Skip loop devices
+        [[ "$devname" == loop* ]] && continue
+
+        local model="" serial="" fw="" cap="" rpm="" info="" smart_ok=false raid="no"
+
+        # --------------------------------------------
+        # SMART detection
+        # --------------------------------------------
         if has smartctl; then
-            info=$($SUDO smartctl -i "$disk" 2>/dev/null || true)
+            if get_smart_info "$disk" &>/dev/null; then
+                smart_ok=true
+                info=$(get_smart_info "$disk")
+            fi
+        fi
+
+        # --------------------------------------------
+        # Parse info if SMART available
+        # --------------------------------------------
+        if [ "$smart_ok" = true ] && [ -n "$info" ]; then
             model=$(echo "$info" | awk -F: '/Device Model|Model Number/ {print $2}' | xargs)
             serial=$(echo "$info" | awk -F: '/Serial Number/ {print $2}' | xargs)
             fw=$(echo "$info" | awk -F: '/Firmware Version/ {print $2}' | xargs)
+
+            # Capacity (multiple possible fields)
             cap=$(echo "$info" | awk -F: '/User Capacity/ {print $2}' | xargs)
+            [ -z "$cap" ] && cap=$(echo "$info" | awk -F: '/Total NVM Capacity/ {print $2}' | xargs)
+            [ -z "$cap" ] && cap=$(echo "$info" | awk -F: '/Namespace [0-9]+ Size/ {print $2}' | xargs)
+
+            # Rotation Rate
             rpm=$(echo "$info" | awk -F: '/Rotation Rate/ {print $2}' | xargs)
+
+            # Full SMART dump fallback for RPM
+            info_full=$($SUDO smartctl -a "$disk" 2>/dev/null)
+            [ -z "$rpm" ] && rpm=$(echo "$info_full" | awk -F: '/Rotation Rate/ {print $2}' | xargs)
         fi
 
-        echo -e "${CYAN}$disk${NC}\n  Model: $model\n  Serial: $serial\n  FW: $fw\n  Size: $cap\n  RPM: $rpm"
-        disks_json=$(echo "$disks_json" | jq --arg disk "$disk" --arg model "$model" --arg serial "$serial" --arg fw "$fw" --arg cap "$cap" --arg rpm "$rpm" '. += [{ disk: $disk, model: $model, serial: $serial, firmware: $fw, capacity: $cap, rotation_rate: $rpm }]')
+        # --------------------------------------------
+        # Fallbacks when SMART unsupported
+        # --------------------------------------------
+        if [ "$smart_ok" = false ] || [ -z "$model" ]; then
+            model=$(udevadm info --query=property --name="$disk" 2>/dev/null | grep '^ID_MODEL=' | cut -d= -f2)
+            serial=$(udevadm info --query=property --name="$disk" 2>/dev/null | grep '^ID_SERIAL=' | cut -d= -f2)
+        fi
+
+        # --------------------------------------------
+        # Capacity fallback via blockdev
+        # --------------------------------------------
+        if [ -z "$cap" ] && has blockdev; then
+            bytes=$(blockdev --getsize64 "$disk" 2>/dev/null)
+            [ -n "$bytes" ] && cap="$(numfmt --to=iec --suffix=B "$bytes")"
+        fi
+
+        # --------------------------------------------
+        # RPM / SSD detection fallback
+        # --------------------------------------------
+        if [ -z "$rpm" ]; then
+            if [[ "$disk" == /dev/nvme* ]]; then
+                rpm="SSD"
+            else
+                rotational=$(cat "/sys/block/$devname/queue/rotational" 2>/dev/null)
+                if [ "$rotational" = "0" ]; then
+                    rpm="SSD"
+                elif [ "$rotational" = "1" ]; then
+                    rpm="Unknown"
+                fi
+            fi
+        fi
+
+        # hdparm fallback for SATA RPM
+        if [ "$rpm" = "Unknown" ] && has hdparm && [[ "$disk" == /dev/sd* ]]; then
+            hdinfo=$(sudo hdparm -I "$disk" 2>/dev/null)
+            rpm=$(echo "$hdinfo" | awk '/RPM/ {print $1}' | xargs)
+        fi
+
+        # --------------------------------------------
+        # RAID detection
+        # --------------------------------------------
+        raid=$(is_raid_member "$disk")
+
+        # --------------------------------------------
+        # Pretty print output
+        # --------------------------------------------
+        echo -e "${CYAN}$disk${NC}"
+        echo -e "  Model:  $model"
+        echo -e "  Serial: $serial"
+        echo -e "  FW:     $fw"
+        echo -e "  Size:   $cap"
+        echo -e "  RPM:    $rpm"
+        echo -e "  RAID:   $raid"
+
+        # --------------------------------------------
+        # JSON append
+        # --------------------------------------------
+        disks_json=$(echo "$disks_json" | jq \
+            --arg disk "$disk" \
+            --arg model "$model" \
+            --arg serial "$serial" \
+            --arg fw "$fw" \
+            --arg cap "$cap" \
+            --arg rpm "$rpm" \
+            --arg raid "$raid" \
+            '. += [{
+                disk: $disk,
+                model: $model,
+                serial: $serial,
+                firmware: $fw,
+                capacity: $cap,
+                rotation_rate: $rpm,
+                raid: $raid
+            }]')
     done
+
+    DISK_INFO_JSON="$disks_json"
 }
 
 # =====================================================================
@@ -368,18 +525,6 @@ fetch_raid_info() {
 #   SECTION 6: PCI & GPU
 # =====================================================================
 
-fetch_pci_info() {
-    header "6. PCI Devices"
-    separator
-
-    pci_json="[]"
-    if has lspci; then
-        while IFS= read -r line; do
-            echo "$line"
-            pci_json=$(echo "$pci_json" | jq --arg l "$line" '. += [$l]')
-        done < <(lspci)
-    fi
-}
 
 fetch_gpu_info() {
     header "6.1. GPU Information"
@@ -405,10 +550,31 @@ fetch_gpu_info() {
     fi
 }
 
+fetch_other_pci_info(){
+    header "6.2 Other PCI Devices"
+    separator
+
+    if has lspci; then
+        local pcis=$(lspci | grep -vi 'vga\|3d\|2d')
+        if [[ -n "$pcis" ]]; then
+            printf "%-10s | %-50s\n" "Slot" "Description"
+            printf "%s\n" "-------------------------------------------------------------"
+            while read -r line; do
+                local slot=$(echo "$line" | awk '{print $1}')
+                local desc=$(echo "$line" | cut -d' ' -f2-)
+                printf "%-10s | %-50s\n" "$slot" "$desc"
+                other_pci_json=$(echo "$other_pci_json" | jq -c --arg slot "$slot" --arg desc "$desc" '. += [{slot: $slot, description: $desc}]')
+            done <<< "$pcis"
+        else
+            echo "No other PCI devices detected."
+        fi
+    else
+        warn "lspci missing – PCI info limited."
+    fi
+}
+
 # =====================================================================
-#   SECTION 7: HIGH-SPEED INTERCONNECTS (replacement)
-#   fetch_network_info() and fetch_hsi_info() removed; replaced by
-#   your consolidated fetch_interconnect_info()
+#   SECTION 7: HIGH-SPEED INTERCONNECTS
 # =====================================================================
 fetch_interconnect_info() {
 
@@ -697,12 +863,8 @@ fetch_cpu_info
 fetch_ram_info
 fetch_disk_info
 fetch_raid_info
-fetch_pci_info
 fetch_gpu_info
-
-### CLEANUP — removed calls to removed functions
-# fetch_network_info
-# fetch_hsi_info
+fetch_other_pci_info
 
 fetch_interconnect_info
 
@@ -716,7 +878,7 @@ canonical_json=$(jq -n \
     --argjson dimms "$ram_devices_json" \
     --argjson disks "$disks_json" \
     --argjson raid "$raid_json" \
-    --argjson pci "$pci_json" \
+    --argjson pci "$other_pci_json" \
     --argjson gpus "$gpu_json" \
     --argjson ic "$interconnect_json" \
     '{
