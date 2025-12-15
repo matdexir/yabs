@@ -80,6 +80,47 @@ check_tools() {
         done
         exit 1
     fi
+    log "All required tools are available."
+}
+
+# ---------------------------
+#   VALIDATION ENVIRONMENT
+# ---------------------------
+
+validate_environment() {
+    header "Environment Validation"
+    separator
+
+    check_tools
+
+
+    if [[ $EUID -eq 0 ]]; then
+      log "Running as root - full access granted"
+    elif has sudo; then
+      if sudo -n true 2>/dev/null; then
+        log "Sudo available and passwordless"
+      else
+        warn "Sudo avaiable but password may be required"
+      fi
+    else
+      warn "Not running as root and sudo not available - some information may be limited"
+    fi
+
+    # Check basic system files
+    local required_files=(
+      "/proc/cpuinfo"
+      "/proc/meminfo"
+      "/sys/class"
+    )
+
+
+    for file in "${required_files[@]}"; do
+      if [[ ! -r "$file" ]]; then
+        warn "Cannot read $file - some information may be limited"
+      fi
+    done
+
+    log "Environment validation completed"
 }
 
 # ---------------------------
@@ -853,7 +894,7 @@ fetch_interconnect_info() {
 #   RUNNING SEQUENCE
 # =====================================================================
 if [[ $VALIDATE_MODE -eq 1 ]]; then
-    validate
+    validate_environment
     exit 0
 fi
 
@@ -899,3 +940,5 @@ elif [[ $JSON_TREE_MODE -eq 1 ]]; then
 else
     log "\nScript completed successfully."
 fi
+
+# vim: et sts=2 sw=2 ts=2
